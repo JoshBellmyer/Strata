@@ -1,0 +1,1386 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0105884..41c72b9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -107,8 +107,20 @@ if(STRATA_ENABLE_CUDA)
+                       "CUDA 12.8 crashed on long prompts on these cards (issues #220, #224). Use CUDA 13.0 or newer.")
+     endif()
+   endforeach()
++  if(STRATA_EXPERIMENTAL_SM60)   # CUDA 12.x warns on every file that sm_70 support will go; it is known
++    string(APPEND CMAKE_CUDA_FLAGS " -Wno-deprecated-gpu-targets")
++  endif()
+   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
+-  set(_strata_gpu_runtime_target CUDA::cudart)
++  # V100 fork: ONE CUDA runtime on Windows.  A C++ executable that links CUDA objects also gets CUDA's implicit link
++  # libraries from the compiler probe (cudadevrt + cudart_static), whatever CMAKE_CUDA_RUNTIME_LIBRARY says; with
++  # CUDA::cudart (the DLL's import library) beside it, MSVC refuses the link: LNK2005 for every cuda* symbol, LNK1169
++  # (CUDA 12.9 + CMake 4.4).  The static runtime is nvcc's own default, so link that one everywhere instead (cuBLAS
++  # stays a DLL; it does not depend on the runtime DLL).
++  if(MSVC)
++    set(_strata_gpu_runtime_target CUDA::cudart_static)
++  else()
++    set(_strata_gpu_runtime_target CUDA::cudart)
++  endif()
+   set(_strata_gpu_blas_target CUDA::cublas)
+   set(_strata_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+ elseif(STRATA_ENABLE_HIP)
+@@ -272,7 +284,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   if((STRATA_BUILD_TESTS OR STRATA_PARITY_PROMPT_ATTN) AND STRATA_ENABLE_CUDA)
+     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
+     target_include_directories(qsa_prompt_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+-    target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels CUDA::cudart)
++    target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+   endif()
+   # the QSA selection (block scores on the warp kernel and the tensor-core one, top-k): a GPU bench with a
+   # scorer-vs-scorer comparison and an FP64 accuracy gate (synthetic, no model); the ctest runs a 32K context under a
+@@ -401,6 +413,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   add_executable(strata src/program/generate.cpp)
+   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
+   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
++  # V100 fork: the prompt path's BF16 GEMM on this GPU - cuBLAS's GemmEx, or the FP32 fallback kernel Volta needs
++  # when cuBLAS has no BF16 GEMM for it (GPU, synthetic, no model)
++  if(STRATA_ENABLE_CUDA)
++    add_executable(bf16_gemm_fallback_test tests/cuda/bf16_gemm_fallback_test.cpp)
++    target_link_libraries(bf16_gemm_fallback_test PRIVATE strata_prefill ${_strata_gpu_runtime_target})
++  endif()
+ 
+   if(STRATA_ENABLE_HIP)
+     enable_testing()
+@@ -880,7 +898,7 @@ if(STRATA_NATIVE_EXPERTS)
+     endif()
+     target_link_libraries(strata_prefill PUBLIC strata_mmq)
+     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
+-    if(STRATA_BUILD_TESTS AND STRATA_MMQ_KQUANTS)
++    if(STRATA_MMQ_KQUANTS)   # V100 fork: built whenever the kernels are (the GPU test script runs it)
+       # the UD-Q4_K_XL expert formats through MMQ against ggml's dequantized weights (synthetic, a few seconds)
+       add_executable(prefill_mmq_kquant_test tests/cuda/prefill_mmq_kquant_test.cpp)
+       target_link_libraries(prefill_mmq_kquant_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+diff --git a/README.md b/README.md
+index 0da642f..1229072 100644
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,8 @@
+ <h1 align="center">Strata</h1>
+ 
++> **This fork:** Tesla V100 (sm_70) support and a layer-split RAM-budget mode for Unsloth's UD-Q4_K_XL on an
++> RTX 4070 Super + Tesla V100 + 96 GB PC - see [docs/V100.md](docs/V100.md) and the scripts in `v100/`.
++
+ <p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>
+ one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to install</p>
+ 
+diff --git a/docs/V100.md b/docs/V100.md
+new file mode 100644
+index 0000000..60575b0
+--- /dev/null
++++ b/docs/V100.md
+@@ -0,0 +1,100 @@
++# Tesla V100 + RTX 4070 Super + 96 GB RAM (this fork)
++
++This fork runs Unsloth's **UD-Q4_K_XL** of Qwen3.8-Flash-Next ([UNSLOTH_Q4.md](UNSLOTH_Q4.md)) on one specific PC:
++
++| | |
++| --- | --- |
++| GPU 0 | RTX 4070 Super, 12 GB, Ada (sm_89), WDDM (it drives the display) |
++| GPU 1 | Tesla V100 PCIe, 32 GB HBM2 (~900 GB/s), Volta (sm_70) |
++| CPU | Core i5-13600K: 6 P-cores + 8 E-cores, AVX2 (no AVX-512) |
++| RAM | 96 GB DDR5 |
++| Toolkit | CUDA 12.9 (CUDA 13 cannot compile for sm_70) |
++
++## Why it should be much faster than upstream
++
++Upstream ran UD-Q4_K_XL on **one GPU** with a RAM budget of RAM − 24 GB (40 GiB on 64 GB). The other ~30 GiB of the
++71.7 GiB of experts came from the SSD for every token: 7-8.5 tok/s, and ~550-750 ms of every verify round was SSD
++time.
++
++Here both cards share the model by a **layer split**, and the RAM budget mode now works on a split:
++
++- the V100 holds roughly 24-26 GiB of experts, the 4070 Super roughly 5-6 GiB, so ~30 of the 71.7 GiB sit on GPUs;
++- the RAM copy holds **only the experts no GPU holds** (~42 GiB), so it fits the 96 GB with room to spare;
++- so nothing is read from the SSD while it answers (`file blobs 0` in the log), and the OS file cache keeps
++  most of the 28.8 GB PLE table as well.
++
++What is left per token is GPU time on two cards plus the CPU computing the experts no GPU holds. Those are the
++coldest ones, so their share of the routed work is well under their ~58% share by count.
++
++**Card order: 4070 Super first (CUDA0), V100 second.** The last stage also carries the output head and the MTP draft
++layer (~1 GB), which costs the 32 GB card little and the 12 GB card a lot. The V100 runs without WDDM's per-launch
++overhead if it is in TCC mode (the Tesla default on Windows), and `--layer-split auto` gives it the layers its
++cache can hold. `tools/v100_bench.py` measures the reverse order too (`v100_first`), along with the V100 alone.
++
++## What changed in the engine
++
++- **V100 (sm_70) correctness.**
++  - `qsa_prompt_attn.cu`: the tensor-core prompt attention checked only the compute capability's *major* number,
++    so a V100 (7.0) was taken for Turing (7.5) and launched a kernel compiled to `__trap()`: a crash on the first
++    long prompt. It now needs 7.5, and Volta keeps the FP32 prompt attention.
++  - `prefill/gemm.cu`: the prompt path's BF16 GEMMs fall back to an FP32 kernel, which reads BF16 exactly, on a card
++    where cuBLAS has no BF16 GemmEx (it answers NOT_SUPPORTED / ARCH_MISMATCH), instead of exiting.
++    `STRATA_BF16_GEMM_FALLBACK=1` forces the kernel, `=0` forbids it.
++  - Every other kernel was compiled for sm_70 and audited. cp.async, tf32 / m16n8k* mma and `ldmatrix` are all
++    behind guards with Volta fallbacks; shared-memory opt-ins are sized per device (96 KB on V100); `__dp4a` and
++    `__nanosleep` exist on sm_70.
++- **The RAM-budget mode on a layer split** (`generate.cpp`).
++  - `--resident-budget-gib` is no longer refused with `--layer-split`.
++  - The later stages' cached experts are passed to the complement planner, so the RAM copy leaves them out.
++  - The adaptive tier's swap now copies an evicted expert back from **the card that owns its layer**. Before, it
++    always read CUDA0's cache, which would have put wrong bytes into RAM on a split.
++  - The exchange buffers are pinned *portable*, so the V100 copies into them by DMA.
++  - Under WDDM the RAM copy is locked in RAM rather than page-locked into two GPU contexts (the reason the arena's
++    pinning is capped at 8 GiB on Windows splits). `STRATA_ARENA_PIN_GIB=0` allows page-locking again.
++- **setup.py**: Volta is admitted without `STRATA_EXPERIMENTAL_SM60=1` (`=0` opts out). The Unsloth model keeps both
++  GPUs (`STRATA_BUDGET_ONE_GPU=1` restores the old one-GPU behavior). The engine is compiled locally for
++  `sm_70;sm_89` with the CUDA 12.x toolkit (`-DSTRATA_EXPERIMENTAL_SM60=ON`, chosen by setup).
++- **The prompt path's MMQ kernels for Q4_K / Q5_K / Q5_1 experts are compiled in** (`-DSTRATA_MMQ_KQUANTS=ON`,
++  added by setup for a Volta build): 4x less GPU time than dequantizing the experts to FP16. Upstream left them off
++  because its prompts waited for the SSD either way, which no longer happens here. `STRATA_MMQ_KQUANTS=0` in the
++  config's `env` switches back (bench variant `no_mmq_kq`); `prefill_mmq_kquant_test` checks them on each card.
++- **New test** `bf16_gemm_fallback_test` (cuBLAS vs fallback against FP64), and the two tools below.
++
++## Running it
++
++All from the Strata folder. Each step writes a log in the Strata folder.
++
++1. `v100\1_setup_and_build.bat` - **uses no GPU** (safe while another program uses the cards). It finds both
++   cards with nvidia-smi, then runs setup with `--setup --build --no-start --family unsloth --model UD-Q4_K_XL
++   --gpus <4070S>,<V100> --context 32768 --vision no`. Setup downloads the 111 GB of shards if they are not in
++   `Strata-data` yet (`--gguf-dir` uses files you already have), packs, compiles the engine, and writes
++   `strata-unsloth-ud-q4_k_xl.json`. The script then compiles the GPU test programs. Log: `v100_setup.log`.
++2. `v100\2_gpu_tests.bat` - **uses both GPUs** (~30-40 min). It runs the kernel parity tests on each card alone,
++   then `tools/v100_bench.py`: every variant reloads the model and measures decode, 4K/16K prompt speed and a
++   greedy coding answer. Logs: `v100_gputest.log`, `v100_bench.log`, `v100_bench.json`.
++3. `v100\3_start_server.bat` (or setup's own `start-unsloth-UD-Q4_K_XL.bat`) - the server on
++   `http://127.0.0.1:8080`.
++
++After step 2, `START-HERE.bat --calibrate` tunes `--spec-min-p`, `--pcie-frac` and the CPU worker count on this PC
++and saves the result in the config.
++
++## Settings worth knowing
++
++| Setting | Default here | Why |
++| --- | --- | --- |
++| `gpu` / `layer_split` in the config | `[4070S, V100]`, `auto` | auto places the boundary so the two caches hold the most routed mass |
++| `--resident-budget-gib` | 71 (RAM − 24, capped at all experts) | a cap: only the ~42 GiB no GPU holds are copied |
++| `--max-context` | 32768 | every GB of KV is a GB less of cached experts; the KV is carved per card (each card holds only its layers') |
++| `STRATA_SPLIT_MISS_MS` | 190 | the split search's cost of a CPU miss; Q4 experts on this CPU may want ~300 (bench variant `miss300`) |
++| `STRATA_KQ256=1` | off | multi-token AVX2 kernels for the CPU's Q4_K/Q5_1/Q8_0 experts (bit-exact; bench variant `kq256`) |
++| `--pool-affinity auto --pool-workers 11` | all cores | keep the E-cores out of the expert pool (bench variant `pcores`) |
++| `STRATA_SPLIT_OWN=1` | off | each card keeps its own prompt buffers: faster prompts, different resident set (bench variant `own_buffers`) |
++
++**Windows commit charge:** the ~42 GiB RAM copy, plus every GPU allocation of a WDDM card, counts against RAM +
++page file. Keep the page file "System managed" (see DETAILS.md, troubleshooting).
++
++## Not done yet (worth doing once the logs are in)
++
++- A Volta tensor-core prompt attention (`mma.m8n8k4` / WMMA 16x16x16). The V100's layers now take the FP32 kernel
++  for long prompts, which is correct but slower.
++- A miss cost for the split search fitted to this CPU, from the bench's numbers.
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 2fb6bb9..c3f8689 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -427,6 +427,10 @@ public:
+         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
+         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
+     void close();
++    /// V100 fork: never ask the driver to page-lock the RAM copy (`cudaHostAlloc`); it is then ordinary memory
++    /// locked in the working set.  A layer split under WDDM sets this: tens of GiB mapped into two GPU contexts
++    /// left WDDM refusing later allocations (the same reason the arena's pinning is capped there).
++    void set_no_pagelock(bool v) { no_pagelock_ = v; }
+ 
+     bool mapped() const { return base_ != nullptr; }
+     int64_t blobs() const { return blobs_; }
+@@ -542,6 +546,7 @@ private:
+     int64_t n_expert_ = 0;
+     uint64_t mapped_bytes_ = 0;
+     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
++    bool no_pagelock_ = false;
+     void* complement_arena_ = nullptr;
+     const uint8_t* complement_host_ = nullptr;
+     const uint8_t* complement_device_ = nullptr;
+diff --git a/setup.py b/setup.py
+index d042d11..8ff0632 100644
+--- a/setup.py
++++ b/setup.py
+@@ -394,13 +394,19 @@ def experimental_sm60() -> bool:
+     return os.environ.get("STRATA_EXPERIMENTAL_SM60", "").strip() == "1"
+ 
+ 
++def volta_ok(arch) -> bool:
++    """V100 fork: Volta (sm_70, Tesla V100 / Titan V) is supported here without the env switch (the engine is then
++    compiled locally with a CUDA 12.x toolkit for sm_70 + the other cards).  STRATA_EXPERIMENTAL_SM60=0 opts out."""
++    return int(arch) == 70 and os.environ.get("STRATA_EXPERIMENTAL_SM60", "").strip() != "0"
++
++
+ def sm60_card(arch) -> bool:
+     return 60 <= int(arch) <= 70
+ 
+ 
+ def gpu_problem(g, together=False):
+     """Why Strata cannot use this card, in plain words (None: it can)."""
+-    if int(g["arch"]) < 75 and not (sm60_card(g["arch"]) and experimental_sm60()):
++    if int(g["arch"]) < 75 and not (sm60_card(g["arch"]) and (experimental_sm60() or volta_ok(g["arch"]))):
+         return (f"not supported - older than the RTX 20 series (compute capability {cc(g)}; Strata needs 7.5 or "
+                 "newer" + ("; STRATA_EXPERIMENTAL_SM60=1 tries the community build for it" if sm60_card(g["arch"])
+                           else "") + ")")
+@@ -1425,7 +1431,12 @@ def source_hash(parts) -> str:
+ 
+ def engine_defs(archs) -> list:
+     """Extra CMake definitions for the engine: the experimental Pascal/Volta build (#295) for cards below sm_75."""
+-    return ["-DSTRATA_EXPERIMENTAL_SM60=ON"] if min(int(x) for x in archs) < 75 else []
++    # V100 fork: a Volta build (the V100 + RTX 4070 Super PC) also gets the MMQ prompt kernels for UD-Q4_K_XL's
++    # Q4_K / Q5_K / Q5_1 experts (4x less GPU time than dequantize + cuBLAS; with the SSD out of the prompt path the
++    # GPU time counts).  STRATA_MMQ_KQUANTS=0 in the config's env switches them off at run time.
++    if min(int(x) for x in archs) < 75:
++        return ["-DSTRATA_EXPERIMENTAL_SM60=ON"] + (["-DSTRATA_MMQ_KQUANTS=ON"] if 70 in {int(x) for x in archs} else [])
++    return []
+ 
+ 
+ def prebuilt_vision(meta: dict, gpu: dict, vision: str) -> str:
+@@ -2365,19 +2376,24 @@ def main() -> int:
+     budget = None
+     if MODELS[model].get("budget"):
+         # Unsloth's UD-Q4_K_XL: a RAM budget of experts, the rest from the GGUF on the SSD - not the low-RAM mode (no
+-        # experts.bin: it would be another 77 GB on the disk), and one GPU (the budget mode has no layer split)
++        # experts.bin: it would be another 77 GB on the disk); several GPUs share it by a layer split (V100 fork)
+         warn(f"{model} is EXPERIMENTAL (docs/UNSLOTH_Q4.md): most of its experts are read from the SSD while it "
+              "answers, so it is several times slower than the 2-3-bit models; quality checked against llama.cpp")
+         if ram < MODELS[model]["ram_gb"]:
+             fail(f"{model} needs {MODELS[model]['ram_gb']} GB of RAM or more; this PC has {ram:.0f} GB",
+                  "choose one of the 2-3-bit models")
+         budget = resident_budget_gib(model, ram)
+-        ok(f"RAM budget: {budget} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
++        ok(f"RAM budget: up to {budget} GiB of {model}'s experts in RAM (the ones no GPU holds), the rest read from "
++           "the model files on the SSD")
+         if a.low_ram not in ("auto", "off"):
+             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
+-        if multi:
+-            warn(f"{model} runs on one GPU: using " + gpu_name(gpu) + " only")
++        if multi and os.environ.get("STRATA_BUDGET_ONE_GPU", "").strip() == "1":
++            warn(f"{model} on one GPU (STRATA_BUDGET_ONE_GPU=1): using " + gpu_name(gpu) + " only")
+             multi, sel, chosen = [], [gpu["index"]], [gpu]
++        elif multi:
++            # V100 fork: the engine's RAM-budget mode runs on a layer split (the RAM copy holds what no GPU holds)
++            ok(f"{model} shares its layers across " + " + ".join(gpu_name(x) for x in chosen) +
++               ": every GPU's expert cache comes out of the RAM budget's work")
+     low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
+                                   (a.low_ram == "auto" and low_ram_needed(model, ram)))
+     if low_ram and multi:
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 32d6408..78eba72 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -1121,7 +1121,8 @@ bool FileExpertSource::pin_cache_complement(
+         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
+                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
+         std::fflush(stderr);
+-        if (pin) {
++        if (pin && no_pagelock_) note = "page-locking skipped (a layer split under WDDM)";
++        if (pin && !no_pagelock_) {
+             const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
+                                                          cudaHostAllocMapped | cudaHostAllocPortable);
+             if (allocated == cudaSuccess) {
+@@ -1344,7 +1345,8 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
+     }
+     const size_t total = (size_t) n * (size_t) blob;
+     void* p = nullptr;
+-    if (cudaHostAlloc(&p, total, cudaHostAllocDefault) == cudaSuccess && p != nullptr) {
++    // Portable: a layer split copies evicted experts back from the later stages' GPUs into these too (V100 fork)
++    if (cudaHostAlloc(&p, total, cudaHostAllocPortable) == cudaSuccess && p != nullptr) {
+         xstage_pinned_ = true;
+     } else {
+         (void) cudaGetLastError();
+diff --git a/src/kernels/cuda/qsa_prompt_attn.cu b/src/kernels/cuda/qsa_prompt_attn.cu
+index e5f85bf..45b6564 100644
+--- a/src/kernels/cuda/qsa_prompt_attn.cu
++++ b/src/kernels/cuda/qsa_prompt_attn.cu
+@@ -979,21 +979,26 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+     {   // sm_75 or newer: the MMA above compiles for both.  sm_80+ runs the cp.async kernel (launch_i8); Turing has
+         // no cp.async, so it runs the v1 kernel (launch<1>, same accuracy, another summation order).  An older card
+         // keeps the old kernel.
+-        static int cc_major[64] = {};
++        // V100 fix: the cache holds 10 * major + minor, not the major alone.  Volta (sm_70) is major 7 like Turing,
++        // but its mma16816 is compiled to __trap() (no m16n8k8 before sm_75), so it must keep the old kernel.
++        static int cc[64] = {};
+         int dev = 0;
+         if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+-        if (cc_major[dev] == 0) {
+-            int major = 0;
+-            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
++        if (cc[dev] == 0) {
++            int major = 0, minor = 0;
++            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
++                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+                 cudaGetLastError();
+                 return false;
+             }
++            const int real = 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);
+             // STRATA_QSA_WARP=1|attn (an A/B arm): the pre-sm_80 kernels on any card, as RTX 20 runs them
++            // (a Volta card stays Volta: it has no kernel to run here)
+             const char* w = std::getenv("STRATA_QSA_WARP");
+-            cc_major[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "attn")) ? 7 : strata::cc_major_of(major);
++            cc[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "attn")) && real >= 75 ? 75 : real;
+         }
+-        if (cc_major[dev] < 7) return false;
+-        turing = cc_major[dev] < 8;
++        if (cc[dev] < 75) return false;
++        turing = cc[dev] < 80;
+     }
+ #if defined(__HIPCC__)
+     // the tensor-core kernels are compiled out on AMD (its major version is not a CUDA sm); RDNA4 has its own int8-KV
+diff --git a/src/prefill/gemm.cu b/src/prefill/gemm.cu
+index cfa966a..d156e59 100644
+--- a/src/prefill/gemm.cu
++++ b/src/prefill/gemm.cu
+@@ -35,6 +35,75 @@
+ namespace strata::prefill {
+ namespace {
+ 
++#if !defined(__HIPCC__)
++// ---- V100 (sm_70) support: a BF16 x BF16 -> FP32 GEMM that needs no BF16 hardware ---------------------------------
++// cuBLAS's BF16 GemmEx is an Ampere-and-newer feature on some toolkits; Volta (and Pascal) may answer
++// CUBLAS_STATUS_NOT_SUPPORTED / ARCH_MISMATCH instead of a product.  BF16 -> FP32 is exact (a 16-bit shift), so this
++// kernel computes the same sum as an FP32 GEMM on the widened inputs, with FP32 accumulation: Y[t, n] = beta*Y[t, n]
++// + sum_k X[t, k] W[n, k].  64 x 64 output tile per block, 256 threads, 4 x 4 outputs per thread, K in steps of 16.
++// Only the prompt path's dense BF16 projections reach it (a small share of a chunk's time), never the decode.
++constexpr int kBfTile = 64, kBfK = 16;
++__global__ void __launch_bounds__(256) bf16_gemm_fallback_kernel(const uint16_t* __restrict__ X,
++                                                                  const uint16_t* __restrict__ W, float* __restrict__ Y,
++                                                                  int T, int N, int K, int ldy, float beta) {
++    __shared__ float xs[kBfK][kBfTile + 1];
++    __shared__ float ws[kBfK][kBfTile + 1];
++    const int tid = threadIdx.x;
++    const int t0 = blockIdx.y * kBfTile, n0 = blockIdx.x * kBfTile;
++    const int tr = (tid / 16) * 4, nc = (tid % 16) * 4;   // this thread's 4 x 4 outputs
++    float acc[4][4] = {};
++    for (int k0 = 0; k0 < K; k0 += kBfK) {
++        // 64 rows x 16 k of X and of W: 1024 values each, 4 per thread
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const int e = tid + i * 256;
++            const int r = e / kBfK, kk = e % kBfK;
++            const int k = k0 + kk;
++            const int t = t0 + r, n = n0 + r;
++            xs[kk][r] = (t < T && k < K) ? __uint_as_float((uint32_t) X[(int64_t) t * K + k] << 16) : 0.0f;
++            ws[kk][r] = (n < N && k < K) ? __uint_as_float((uint32_t) W[(int64_t) n * K + k] << 16) : 0.0f;
++        }
++        __syncthreads();
++#pragma unroll
++        for (int kk = 0; kk < kBfK; ++kk) {
++            float a[4], b[4];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) { a[i] = xs[kk][tr + i]; b[i] = ws[kk][nc + i]; }
++#pragma unroll
++            for (int i = 0; i < 4; ++i)
++#pragma unroll
++                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
++        }
++        __syncthreads();
++    }
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const int t = t0 + tr + i;
++        if (t >= T) continue;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const int n = n0 + nc + j;
++            if (n >= N) continue;
++            float* y = Y + (int64_t) t * ldy + n;
++            *y = beta != 0.0f ? fmaf(beta, *y, acc[i][j]) : acc[i][j];
++        }
++    }
++}
++
++// Per device: does cuBLAS run BF16 GemmEx here?  1 yes, 0 no (use the kernel above), -1 not asked yet.
++// STRATA_BF16_GEMM_FALLBACK=1 forces the kernel on any card (the parity arm), =0 forbids it.
++int g_bf16_cublas[64] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++                         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++                         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
++int bf16_fallback_env() {
++    static const int v = [] {
++        const char* e = std::getenv("STRATA_BF16_GEMM_FALLBACK");
++        return e && *e ? std::atoi(e) : -1;
++    }();
++    return v;
++}
++#endif
++
+ void ck(cublasStatus_t s, const char* what) {
+     if (s != CUBLAS_STATUS_SUCCESS) {
+         std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d\n", what, (int) s);
+@@ -365,12 +434,41 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
+                       beta, stream_)) {
+         return;
+     }
++#endif
++#if !defined(__HIPCC__)
++    int dev = 0;
++    cudaGetDevice(&dev);
++    int* known = (dev >= 0 && dev < 64) ? &g_bf16_cublas[dev] : nullptr;
++    const int env = bf16_fallback_env();
++    if (env == 1 || (env != 0 && known && *known == 0)) {
++        const dim3 grid((unsigned) ((N + kBfTile - 1) / kBfTile), (unsigned) ((T + kBfTile - 1) / kBfTile));
++        bf16_gemm_fallback_kernel<<<grid, 256, 0, (cudaStream_t) stream_>>>(X, W, Y, (int) T, (int) N, (int) K,
++                                                                            (int) ldy, beta);
++        if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) {
++            std::fprintf(stderr, "prefill gemm: bf16 fallback kernel: %s\n", cudaGetErrorString(e));
++            std::exit(1);
++        }
++        return;
++    }
+ #endif
+     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
+-    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+-                    CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
+-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+-       "cublasGemmEx");
++    const cublasStatus_t st = cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T,
++                                           (int) K, &alpha, W, CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta,
++                                           Y, CUDA_R_32F, (int) ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
++#if !defined(__HIPCC__)
++    if (st != CUBLAS_STATUS_SUCCESS && known && *known != 1 && env != 0 &&
++        (st == CUBLAS_STATUS_NOT_SUPPORTED || st == CUBLAS_STATUS_ARCH_MISMATCH)) {
++        // Volta / Pascal: no BF16 GemmEx in this cuBLAS - the kernel above from now on, for this device.  The call
++        // was rejected before anything ran, so Y is untouched and the same product is simply made by the kernel.
++        std::fprintf(stderr, "prefill gemm: device %d: cuBLAS has no BF16 GEMM here (status %d); using the FP32 "
++                             "fallback kernel for the BF16 projections\n", dev, (int) st);
++        *known = 0;
++        bf16(X, W, Y, T, N, K, ldy, beta);
++        return;
++    }
++    if (st == CUBLAS_STATUS_SUCCESS && known && *known < 0) *known = 1;
++#endif
++    ck(st, "cublasGemmEx");
+ }
+ 
+ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+diff --git a/src/prefill/moe_mmq.cu b/src/prefill/moe_mmq.cu
+index 3566907..650df01 100644
+--- a/src/prefill/moe_mmq.cu
++++ b/src/prefill/moe_mmq.cu
+@@ -90,6 +90,15 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
+ bool built() { return true; }
+ 
+ bool supported(int t) {
++#ifdef STRATA_MMQ_KQUANTS
++    // V100 fork: STRATA_MMQ_KQUANTS=0 sends the Q4_K / Q5_K / Q5_1 experts back to the FP16 dequantize + cuBLAS
++    // path (the A/B arm of a build that has the MMQ kernels)
++    static const bool kq_off = [] {
++        const char* v = std::getenv("STRATA_MMQ_KQUANTS");
++        return v != nullptr && v[0] == '0';
++    }();
++    if (kq_off && (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q5_1)) return false;
++#endif
+     switch ((ggml_type) t) {
+         case GGML_TYPE_Q2_0:
+ #ifdef STRATA_ORCA_Q4KS_MMQ
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 1a2f203..cdf01f4 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -126,14 +126,22 @@ using Clock = std::chrono::steady_clock;
+ // reads the file.  Swaps that need no exchange (`out` in the lend region is held in RAM already; or `in` is not) go
+ // on as before; ones beyond the buffers' room wait for a later round.  Runs on the adaptive tier's thread while the
+ // GPU commits and drafts: the copies back are on its stream, and waited for before the refills are queued.
+-template <class Swap>
+-bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::ExpertCache& cache,
+-                          const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
+-                          cudaStream_t stream) {
++// V100 + layer split: `owner(layer)` names the cache that holds the layer's slots, its device and the stream to copy
++// on (a layer split's later stages own their layers' slots; the slot numbers in `host_res` index THAT cache).  The
++// one-GPU call keeps CUDA0's cache, device -1 (the current one) and `stream`.
++struct SwapOwner {
++    strata::core::ExpertCache* cache = nullptr;
++    int dev = -1;
++    cudaStream_t stream = nullptr;
++};
++template <class Swap, class Owner>
++bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res,
++                          int64_t n_expert, std::vector<Swap>& swaps, Owner&& owner) {
+     if (!src.complement_ready() || swaps.empty()) return true;
+     struct Staged { int32_t layer, in, out; int64_t q; };
+     std::vector<Staged> staged;
+     std::vector<Swap> kept;
++    std::vector<SwapOwner> used;   // every stream a copy went on, synchronized below
+     kept.reserve(swaps.size());
+     for (const Swap& s : swaps) {
+         if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
+@@ -141,21 +149,37 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::Exp
+         if (q >= src.exchange_capacity()) continue;
+         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
+         if (slot < 0) continue;
+-        if (cudaMemcpyAsync(src.exchange_buffer(q), cache.device_slot(slot),
++        const SwapOwner w = owner(s.layer);
++        if (w.cache == nullptr) continue;
++        const strata::core::OnDevice on(w.dev);
++        if (cudaMemcpyAsync(src.exchange_buffer(q), w.cache->device_slot(slot),
+                             (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), cudaMemcpyDeviceToHost,
+-                            stream) != cudaSuccess)
++                            w.stream) != cudaSuccess)
+             return false;
++        bool seen = false;
++        for (const SwapOwner& u : used) seen = seen || (u.dev == w.dev && u.stream == w.stream);
++        if (!seen) used.push_back(w);
+         staged.push_back({s.layer, s.in, s.out, q});
+         kept.push_back(s);
+     }
+     if (!staged.empty()) {
+-        if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
++        for (const SwapOwner& u : used) {
++            const strata::core::OnDevice on(u.dev);
++            if (cudaStreamSynchronize(u.stream) != cudaSuccess) return false;
++        }
+         for (const Staged& x : staged)
+             if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) return false;
+     }
+     swaps.swap(kept);
+     return true;
+ }
++template <class Swap>
++bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::ExpertCache& cache,
++                          const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
++                          cudaStream_t stream) {
++    return resident_stage_swaps(src, host_res, n_expert, swaps,
++                                [&](int32_t) { return SwapOwner{&cache, -1, stream}; });
++}
+ 
+ struct Options {
+     std::string pack = "pack/full";
+@@ -1320,10 +1344,15 @@ int main(int argc, char** argv) {
+         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
+         return 2;
+     }
++    // V100 support: the RAM-budget mode (--resident-budget-gib, Unsloth's UD-Q4_K_XL) runs on a layer split - the
++    // RAM copy then holds what NO stage's cache holds (every stage's pairs are passed to the complement planner).
++    // The plain resident mode (--resident-experts, with its prompt-path lend region) and the helper caches stay
++    // one-GPU: the lend region is CUDA0's alone.
+     if (o.resident_cpu_experts &&
+-        (!o.layer_split.empty() || o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
+-         o.expert_cache_remote[2] > 0)) {
+-        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
++        ((!o.layer_split.empty() && o.resident_budget == 0) || o.expert_cache_remote[0] > 0 ||
++         o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)) {
++        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits (except with "
++                             "--resident-budget-gib) or remote expert caches\n");
+         return 2;
+     }
+     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
+@@ -3757,7 +3786,25 @@ int main(int argc, char** argv) {
+             const int64_t k = plan_lend(chunk);
+             if (k > 0) lend_from = xcache.slots() - k;
+         }
+-        if (src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
++        // a layer split: the later stages' caches hold their layers' experts on their own GPUs - none of those is
++        // copied into RAM (the budget goes to the hottest experts no GPU holds)
++        std::vector<std::pair<int32_t, int32_t>> stage_pairs;
++        for (auto& st : stages)
++            for (int64_t l = st->lb; l < st->le; ++l)
++                for (int64_t e = 0; e < g.n_expert; ++e)
++                    if (st->cache.slot_of(l, e) != strata::core::kNotResident)
++                        stage_pairs.emplace_back((int32_t) l, (int32_t) e);
++        if (!stage_pairs.empty())
++            std::fprintf(stderr, "strata generate: resident RAM mode on a layer split: %zu experts held by the later "
++                                 "stages' GPUs are left out of the RAM copy\n", stage_pairs.size());
++        // under WDDM a split keeps the RAM copy out of the GPU contexts (locked in RAM instead of page-locked by the
++        // driver; STRATA_ARENA_PIN_GIB=0 allows it again, as for the arena)
++        if (multi_gpu && under_wddm() && strata::core::arena_pin_cap_gib() != 0) {
++            src.set_no_pagelock(true);
++            std::fprintf(stderr, "strata generate: layer split under WDDM: the RAM copy of the experts is locked in "
++                                 "RAM, not page-locked by the GPU driver\n");
++        }
++        if (src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from, o.resident_headroom,
+                                      o.resident_budget, &profile)) {
+             if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
+                 !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
+@@ -4453,7 +4500,13 @@ int main(int argc, char** argv) {
+             }
+             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+-            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
++            // a layer split: each evicted expert is copied back from the cache (and device) that owns its layer
++            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, [&](int32_t layer) {
++                    const int stn = multi_gpu ? stage_of(layer) : 0;
++                    GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
++                    return gs ? SwapOwner{&gs->cache, gs->dev, gs->adapt_stream} : SwapOwner{&xcache, -1, adapt_stream};
++                }))
++                return false;
+             bool main_live = false;
+             for (const Swap& s : swaps) {
+                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
+diff --git a/tests/cuda/bf16_gemm_fallback_test.cpp b/tests/cuda/bf16_gemm_fallback_test.cpp
+new file mode 100644
+index 0000000..bf89075
+--- /dev/null
++++ b/tests/cuda/bf16_gemm_fallback_test.cpp
+@@ -0,0 +1,112 @@
++// tests/cuda/bf16_gemm_fallback_test.cpp - V100 fork: the prompt path's BF16 GEMM (Gemm::bf16) on this GPU.
++//
++//   bf16_gemm_fallback_test cublas     cuBLAS's BF16 GemmEx (falls back to the kernel by itself if cuBLAS refuses)
++//   bf16_gemm_fallback_test fallback   the FP32 fallback kernel (STRATA_BF16_GEMM_FALLBACK=1) on any card
++//
++// Random BF16 X [T, K] and W [N, K], Y = X . W^T (+ beta * Y) against an FP64 CPU reference, on shapes like the
++// prompt path's (ragged edges included).  Prints the largest relative error and the time; exit 0 when every case
++// is within 1e-3 of the largest |Y| (FP32 accumulation of exact BF16 products), 1 otherwise.
++#include "strata/prefill/gemm.hpp"
++
++#include <cuda_runtime.h>
++
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++
++namespace {
++
++uint16_t to_bf16(float f) {
++    uint32_t u;
++    std::memcpy(&u, &f, 4);
++    u += 0x7fffu + ((u >> 16) & 1u);   // round to nearest even (no NaNs here)
++    return (uint16_t) (u >> 16);
++}
++float from_bf16(uint16_t h) {
++    const uint32_t u = (uint32_t) h << 16;
++    float f;
++    std::memcpy(&f, &u, 4);
++    return f;
++}
++
++bool ck(cudaError_t e, const char* what) {
++    if (e != cudaSuccess) std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
++    return e == cudaSuccess;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    const std::string mode = argc > 1 ? argv[1] : "cublas";
++#if defined(_WIN32)
++    _putenv_s("STRATA_BF16_GEMM_FALLBACK", mode == "fallback" ? "1" : "-1");
++#else
++    setenv("STRATA_BF16_GEMM_FALLBACK", mode == "fallback" ? "1" : "-1", 1);
++#endif
++    int dev = 0;
++    cudaDeviceProp p{};
++    if (!ck(cudaGetDevice(&dev), "cudaGetDevice") || !ck(cudaGetDeviceProperties(&p, dev), "props")) return 1;
++    std::printf("bf16_gemm_fallback_test (%s) on %s, sm_%d%d\n", mode.c_str(), p.name, p.major, p.minor);
++    cudaStream_t st = nullptr;
++    if (!ck(cudaStreamCreate(&st), "stream")) return 1;
++    strata::prefill::Gemm gemm;
++    std::string err;
++    if (!gemm.init(st, 1 << 20, err)) { std::fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
++
++    struct Case { int64_t T, N, K; float beta; };
++    const Case cases[] = {{1, 1, 16, 0.0f},     {7, 33, 100, 0.0f},     {64, 64, 64, 1.0f},
++                          {200, 2560, 640, 0.0f}, {513, 640, 2560, 1.0f}, {512, 2560, 2560, 0.0f}};
++    std::mt19937 rng(1234);
++    std::normal_distribution<float> nd(0.0f, 1.0f);
++    bool all_ok = true;
++    for (const Case& c : cases) {
++        std::vector<uint16_t> X((size_t) (c.T * c.K)), W((size_t) (c.N * c.K));
++        for (auto& v : X) v = to_bf16(nd(rng));
++        for (auto& v : W) v = to_bf16(nd(rng) * 0.05f);
++        std::vector<float> Y0((size_t) (c.T * c.N));
++        for (auto& v : Y0) v = nd(rng);
++        uint16_t *dX = nullptr, *dW = nullptr;
++        float* dY = nullptr;
++        if (!ck(cudaMalloc(&dX, X.size() * 2), "malloc") || !ck(cudaMalloc(&dW, W.size() * 2), "malloc") ||
++            !ck(cudaMalloc(&dY, Y0.size() * 4), "malloc"))
++            return 1;
++        cudaMemcpy(dX, X.data(), X.size() * 2, cudaMemcpyHostToDevice);
++        cudaMemcpy(dW, W.data(), W.size() * 2, cudaMemcpyHostToDevice);
++        cudaMemcpy(dY, Y0.data(), Y0.size() * 4, cudaMemcpyHostToDevice);
++        gemm.bf16(dX, dW, dY, c.T, c.N, c.K, 0, c.beta);   // warm-up / the first call decides cuBLAS or not
++        cudaMemcpy(dY, Y0.data(), Y0.size() * 4, cudaMemcpyHostToDevice);
++        cudaStreamSynchronize(st);
++        const auto t0 = std::chrono::steady_clock::now();
++        gemm.bf16(dX, dW, dY, c.T, c.N, c.K, 0, c.beta);
++        if (!ck(cudaStreamSynchronize(st), "gemm")) return 1;
++        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        std::vector<float> Y(Y0.size());
++        cudaMemcpy(Y.data(), dY, Y.size() * 4, cudaMemcpyDeviceToHost);
++        double max_ref = 0, max_err = 0;
++        for (int64_t t = 0; t < c.T; ++t)
++            for (int64_t n = 0; n < c.N; ++n) {
++                double r = c.beta != 0.0f ? (double) c.beta * Y0[(size_t) (t * c.N + n)] : 0.0;
++                for (int64_t k = 0; k < c.K; ++k)
++                    r += (double) from_bf16(X[(size_t) (t * c.K + k)]) * (double) from_bf16(W[(size_t) (n * c.K + k)]);
++                max_ref = std::max(max_ref, std::fabs(r));
++                max_err = std::max(max_err, std::fabs(r - (double) Y[(size_t) (t * c.N + n)]));
++            }
++        const double rel = max_err / std::max(max_ref, 1e-30);
++        const bool ok = rel < 1e-3;
++        all_ok = all_ok && ok;
++        std::printf("  T=%-5lld N=%-5lld K=%-5lld beta=%.0f  max rel err %.2e  %8.3f ms  %.2f TFLOP/s  %s\n",
++                    (long long) c.T, (long long) c.N, (long long) c.K, c.beta, rel, ms,
++                    2.0 * c.T * c.N * c.K / (ms * 1e9), ok ? "ok" : "FAIL");
++        cudaFree(dX);
++        cudaFree(dW);
++        cudaFree(dY);
++    }
++    std::printf("%s\n", all_ok ? "PASS" : "FAIL");
++    return all_ok ? 0 : 1;
++}
+diff --git a/tools/test_setup_choices.py b/tools/test_setup_choices.py
+index 195e308..7354398 100644
+--- a/tools/test_setup_choices.py
++++ b/tools/test_setup_choices.py
+@@ -101,10 +101,13 @@ class ExperimentalSm60(unittest.TestCase):
+ 
+     def test_the_gate(self):
+         with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM60": ""}):
+-            for arch in ("60", "61", "70"):
++            for arch in ("60", "61"):
+                 p = setup.gpu_problem(self.card(arch))
+                 self.assertIn("not supported", p)
+                 self.assertIn("STRATA_EXPERIMENTAL_SM60=1", p)
++            self.assertIsNone(setup.gpu_problem(self.card("70")))   # V100 fork: Volta admitted by default
++        with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM60": "0"}):
++            self.assertIn("not supported", setup.gpu_problem(self.card("70")))
+             self.assertNotIn("STRATA_EXPERIMENTAL_SM60", setup.gpu_problem(self.card("52")))
+             self.assertIsNone(setup.gpu_problem(self.card("75")))
+         with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM60": "1"}):
+@@ -115,7 +118,7 @@ class ExperimentalSm60(unittest.TestCase):
+ 
+     def test_the_build_flag(self):
+         self.assertEqual(setup.engine_defs([61]), ["-DSTRATA_EXPERIMENTAL_SM60=ON"])
+-        self.assertEqual(setup.engine_defs([70, 86]), ["-DSTRATA_EXPERIMENTAL_SM60=ON"])
++        self.assertEqual(setup.engine_defs([70, 86]), ["-DSTRATA_EXPERIMENTAL_SM60=ON", "-DSTRATA_MMQ_KQUANTS=ON"])
+         self.assertEqual(setup.engine_defs([75, 86, 120]), [])
+ 
+     def test_find_nvcc_below(self):
+diff --git a/tools/test_setup_unsloth.py b/tools/test_setup_unsloth.py
+index 080b51c..8516e6f 100644
+--- a/tools/test_setup_unsloth.py
++++ b/tools/test_setup_unsloth.py
+@@ -7,6 +7,8 @@ engine version it needs, one GPU, no images.  Mocked - no GPU, no downloads, not
+ from __future__ import annotations
+ 
+ import contextlib
++import os
++from unittest import mock
+ import hashlib
+ import io
+ import json
+@@ -243,11 +245,26 @@ class Main(unittest.TestCase):
+         self.assertIn("needs 48 GB of RAM or more", out)
+         self.assertEqual(self.downloads, [])
+ 
+-    def test_one_gpu_and_no_images(self):
++    def test_two_gpus_and_no_images(self):
++        # V100 fork: the RAM-budget mode keeps the layer split (STRATA_BUDGET_ONE_GPU=1 restores one GPU)
+         code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1", "--vision", "yes", "--low-ram", "on"],
+                                    n_gpus=2)
+         self.assertEqual(code, 0, out)
+-        self.assertIn("runs on one GPU", out)
++        self.assertIn("shares its layers across", out)
++        self.assertEqual(cfg["gpu"], [0, 1])
++        self.assertEqual(cfg["layer_split"], "auto")
++        self.assertIn("images are not available with UD-Q4_K_XL", out)
++        self.assertIn("--low-ram on does not apply", out)
++        self.assertNotIn("--vision", cfg["args"])
++        self.assertNotIn("--mmap-experts", cfg["args"])
++        self.assertFalse(any("--experts-bin" in r for r in self.runs))
++
++    def test_one_gpu_and_no_images(self):
++        with mock.patch.dict(os.environ, {"STRATA_BUDGET_ONE_GPU": "1"}):
++            code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1", "--vision", "yes", "--low-ram", "on"],
++                                       n_gpus=2)
++        self.assertEqual(code, 0, out)
++        self.assertIn("on one GPU", out)
+         self.assertIn("images are not available with UD-Q4_K_XL", out)
+         self.assertIn("--low-ram on does not apply", out)
+         self.assertNotIn("layer_split", cfg)
+diff --git a/tools/v100_bench.py b/tools/v100_bench.py
+new file mode 100644
+index 0000000..a1cccd6
+--- /dev/null
++++ b/tools/v100_bench.py
+@@ -0,0 +1,240 @@
++"""V100 fork: measure UD-Q4_K_XL on the RTX 4070 Super + Tesla V100 + 96 GB PC, one engine setting per run.
++
++Every variant restarts the engine with one change against the config setup wrote (strata-unsloth-ud-q4_k_xl.json),
++then measures:
++  - decode: greedy tok/s on three short chat prompts (twice each, median), with the expert tiers per request
++    (GPU hits, RAM blobs, file blobs/MB: file reads should be 0 once the RAM copy holds every non-GPU expert);
++  - prompt: tok/s reading a ~4K and a ~16K token prompt (text from this repository's docs, a fresh slice each
++    time so the prompt cache cannot help);
++  - a quality check: the greedy answer to a fixed coding prompt, written out in full so it can be read, with the
++    position where its tokens first differ from the first variant's (a small late difference is a near-tie flip;
++    garbage or an early split would mean a broken kernel).
++Everything goes to one log file (and a JSON next to it).  The engine's own log is the config's "log" file.
++
++    .venv\\Scripts\\python tools\\v100_bench.py strata-unsloth-ud-q4_k_xl.json --log v100_bench.log
++    ... --variants baseline,kq256       (a subset; --list shows them)
++"""
++from __future__ import annotations
++
++import argparse
++import copy
++import hashlib
++import json
++import os
++import platform
++import statistics
++import subprocess
++import sys
++import threading
++import time
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / "tools"))
++sys.path.insert(0, str(ROOT))
++
++import calibrate as CAL  # noqa: E402  (chat_ids, with_arg, close)
++
++DECODE_PROMPTS = CAL.PROMPTS
++QUALITY_PROMPT = ("Write a Python class LRUCache with get and put in O(1), using an OrderedDict, "
++                  "with a short docstring and three asserts that test it.")
++DECODE_NEW = 192
++QUALITY_NEW = 320
++
++
++def swap_gpus(cfg):
++    if isinstance(cfg.get("gpu"), list) and len(cfg["gpu"]) == 2:
++        cfg["gpu"] = list(reversed(cfg["gpu"]))
++
++
++def one_gpu(which):
++    def f(cfg):
++        if isinstance(cfg.get("gpu"), list):
++            cfg["gpu"] = cfg["gpu"][which]          # an int: the server runs it on that card alone
++            cfg.pop("layer_split", None)
++    return f
++
++
++# name -> (what it tests, extra args {flag: value|None to remove}, extra env, cfg edit)
++VARIANTS = {
++    "baseline": ("the config as setup wrote it (layer split auto, 4070S first)", {}, {}, None),
++    "kq256": ("multi-token AVX2 kernels for the Q4_K / Q5_1 / Q8_0 CPU experts", {}, {"STRATA_KQ256": "1"}, None),
++    "pcores": ("CPU pool on the P-cores and their SMT siblings only (11 workers)",
++               {"--pool-affinity": "auto", "--pool-workers": "11"}, {}, None),
++    "pcores6": ("CPU pool on the P-cores only, one per core (5 workers + the host thread)",
++                {"--pool-affinity": "p-cores"}, {}, None),
++    "own_buffers": ("every GPU keeps its own prompt buffers (no loan from the expert caches)", {},
++                    {"STRATA_SPLIT_OWN": "1"}, None),
++    "no_mmq_kq": ("prompt experts by FP16 dequantize + cuBLAS instead of the MMQ kernels", {},
++                  {"STRATA_MMQ_KQUANTS": "0"}, None),
++    "miss300": ("layer split placement with a higher CPU-miss cost (Q4 experts on a 6P+8E AVX2 CPU)", {},
++                {"STRATA_SPLIT_MISS_MS": "300"}, None),
++    "v100_first": ("the V100 as the first GPU (the 4070S then holds the head and the draft layer)", {}, {},
++                   swap_gpus),
++    "v100_only": ("the V100 alone (what upstream Strata would do: one GPU)", {}, {}, one_gpu(1)),
++}
++DEFAULT_ORDER = ["baseline", "kq256", "pcores", "own_buffers", "no_mmq_kq", "miss300", "v100_first", "v100_only"]
++
++
++class Log:
++    def __init__(self, path: Path):
++        self.f = open(path, "a", encoding="utf-8")
++
++    def __call__(self, *parts):
++        line = " ".join(str(p) for p in parts)
++        print(line, flush=True)
++        self.f.write(line + "\n")
++        self.f.flush()
++
++
++def load_tokenizer(cfg):
++    import strata_tokenizer as ST
++    tpath = Path(cfg["tokenizer"])
++    vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
++    toks = [None] * len(vocab)
++    for t, i in vocab.items():
++        toks[i] = t
++    return ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
++                        json.loads((tpath / "token_type.json").read_text()))
++
++
++def corpus_ids(tok, n_tokens: int, offset: int) -> list[int]:
++    """~n_tokens of this repository's own text (docs, then sources), starting `offset` characters in."""
++    text = ""
++    for p in sorted((ROOT / "docs").glob("*.md")) + sorted((ROOT / "src").rglob("*.cpp")):
++        text += p.read_text(encoding="utf-8", errors="replace") + "\n"
++        if len(text) > offset + n_tokens * 6:
++            break
++    body = text[offset:offset + n_tokens * 5]
++    ids = tok.encode("<|im_start|>user\nSummarize the following in three sentences.\n\n", parse_special=True)
++    ids += tok.encode(body)
++    ids = ids[:n_tokens]
++    ids += tok.encode("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", parse_special=True)
++    return ids
++
++
++def gen(eng, ids, max_new):
++    out = [t for t in eng.generate(ids, max_new, {"temperature": 0}, threading.Event()) if t is not None]
++    return out, dict(eng.last or {})
++
++
++def nvsmi(log):
++    try:
++        r = subprocess.run(["nvidia-smi", "--query-gpu=index,name,pci.bus_id,driver_model.current,memory.used,"
++                            "memory.total,pcie.link.gen.current,pcie.link.width.current,clocks.max.sm",
++                            "--format=csv"], capture_output=True, text=True, timeout=30)
++        for line in r.stdout.strip().splitlines():
++            log("   ", line)
++    except Exception as e:  # noqa: BLE001
++        log("    nvidia-smi failed:", e)
++
++
++def run_variant(name, base_cfg, tok, log, first_quality):
++    what, extra_args, extra_env, edit = VARIANTS[name]
++    cfg = copy.deepcopy(base_cfg)
++    if edit:
++        edit(cfg)
++    args = list(cfg["args"])
++    for flag, val in extra_args.items():
++        args = CAL.with_arg(args, flag, val)
++    cfg["args"] = args
++    cfg.setdefault("env", {}).update(extra_env)
++    from serve.server import StrataEngine, child_env, engine_args
++    log(f"\n=== variant {name}: {what}")
++    log("    gpu:", cfg.get("gpu"), " env:", json.dumps(extra_env), " extra args:", json.dumps(extra_args))
++    res = {"variant": name, "what": what}
++    t0 = time.time()
++    try:
++        eng = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=child_env(cfg))
++    except Exception as e:  # noqa: BLE001
++        log("    ENGINE FAILED TO START:", e)
++        res["error"] = str(e)
++        return res
++    res["load_s"] = round(time.time() - t0, 1)
++    res["info"] = dict(eng.info)
++    log(f"    loaded in {res['load_s']} s; INFO", json.dumps(eng.info))
++    nvsmi(log)
++    try:
++        gen(eng, CAL.chat_ids(tok, DECODE_PROMPTS[0]), 32)          # warm-up
++        rates, tiers = [], []
++        for rep in range(2):
++            for p in DECODE_PROMPTS:
++                out, last = gen(eng, CAL.chat_ids(tok, p), DECODE_NEW)
++                ms = last.get("decode_ms") or 0
++                r = len(out) / (ms / 1000) if ms > 0 and len(out) > 8 else 0.0
++                rates.append(r)
++                tiers.append({k: last.get(k) for k in ("hits", "lookups", "ram_blobs", "file_blobs", "file_mb",
++                                                        "drafts_accepted", "drafts_offered")})
++                acc = last.get("drafts_accepted"), last.get("drafts_offered")
++                hit = (100.0 * last["hits"] / last["lookups"]) if last.get("lookups") else None
++                log(f"    decode rep{rep} {r:6.1f} tok/s  ({len(out)} tok, {ms:.0f} ms)  drafts {acc[0]}/{acc[1]}"
++                    + (f"  GPU hit {hit:.1f}%" if hit is not None else "")
++                    + f"  RAM blobs {last.get('ram_blobs')}  file blobs {last.get('file_blobs')}"
++                      f" ({last.get('file_mb')} MB)")
++        res["decode_tok_s"] = round(statistics.median(rates), 2)
++        res["decode_all"] = [round(x, 2) for x in rates]
++        res["tiers"] = tiers
++        log(f"    DECODE median {res['decode_tok_s']} tok/s")
++        for n, off in ((4096, 1000 + 7919 * len(name)), (16384, 200000 + 7919 * len(name))):
++            ids = corpus_ids(tok, n, off)
++            out, last = gen(eng, ids, 8)
++            pms = last.get("prompt_ms") or 0
++            pt = last.get("prompt_tokens") or len(ids)
++            rate = pt / (pms / 1000) if pms > 0 else 0.0
++            res[f"prompt_{n}_tok_s"] = round(rate, 1)
++            log(f"    PROMPT {pt} tokens: {rate:7.1f} tok/s ({pms / 1000:.1f} s); reused {last.get('reused')}")
++        out, last = gen(eng, CAL.chat_ids(tok, QUALITY_PROMPT), QUALITY_NEW)
++        res["quality_ids_sha"] = hashlib.sha256(json.dumps(out).encode()).hexdigest()[:16]
++        res["quality_ids"] = out
++        if first_quality is not None:
++            same = next((i for i, (a, b) in enumerate(zip(first_quality, out)) if a != b), min(len(out), len(first_quality)))
++            res["quality_first_diff"] = same
++            log(f"    QUALITY: first token that differs from the first variant's answer: {same} of {len(out)}")
++        log("    QUALITY answer:\n" + "\n".join("      | " + l for l in tok.decode(out).splitlines()))
++    except Exception as e:  # noqa: BLE001
++        log("    VARIANT FAILED:", repr(e))
++        res["error"] = repr(e)
++    finally:
++        CAL.close(eng)
++        time.sleep(5)                                   # the driver gives the memory back
++    return res
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("config")
++    ap.add_argument("--log", default="v100_bench.log")
++    ap.add_argument("--variants", default=",".join(DEFAULT_ORDER))
++    ap.add_argument("--list", action="store_true")
++    a = ap.parse_args()
++    if a.list:
++        for k, v in VARIANTS.items():
++            print(f"{k:12s} {v[0]}")
++        return 0
++    cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig"))
++    log = Log(Path(a.log))
++    log(f"==== v100_bench {time.strftime('%Y-%m-%d %H:%M:%S')}  config {a.config}")
++    log("    host:", platform.platform(), platform.processor(), "python", platform.python_version())
++    log("    config:", json.dumps(cfg))
++    nvsmi(log)
++    tok = load_tokenizer(cfg)
++    results, first_q = [], None
++    for name in [v.strip() for v in a.variants.split(",") if v.strip()]:
++        if name not in VARIANTS:
++            log("    unknown variant", name)
++            continue
++        r = run_variant(name, cfg, tok, log, first_q)
++        if first_q is None and r.get("quality_ids"):
++            first_q = r["quality_ids"]
++        results.append(r)
++    log("\n==== summary (decode median tok/s | prompt 4K | prompt 16K | quality diff | load s)")
++    for r in results:
++        log(f"    {r['variant']:12s} {r.get('decode_tok_s', '-'):>8} | {r.get('prompt_4096_tok_s', '-'):>7} | "
++            f"{r.get('prompt_16384_tok_s', '-'):>7} | {r.get('quality_first_diff', '-'):>5} | {r.get('load_s', '-')}"
++            + (f"  ERROR {r['error']}" if r.get("error") else ""))
++    Path(a.log).with_suffix(".json").write_text(json.dumps(results, indent=1), encoding="utf-8")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/v100_gputest.py b/tools/v100_gputest.py
+new file mode 100644
+index 0000000..7a2b704
+--- /dev/null
++++ b/tools/v100_gputest.py
+@@ -0,0 +1,143 @@
++"""V100 fork: the GPU tests, for when the GPUs are free (stop any other GPU program first).
++
++1. The kernel parity programs (synthetic data, no model) on each card alone - the V100 first: GPU kernels against
++   their CPU / FP64 references, plus the prompt path's BF16 GEMM through cuBLAS and through the Volta fallback.
++2. tools/v100_bench.py on the config setup wrote: decode / prompt speed and a quality check per setting.
++Everything goes to one log (default v100_gputest.log); the bench adds v100_bench.log / .json.
++
++    .venv\\Scripts\\python tools\\v100_gputest.py                     (what v100\\2_gpu_tests.bat runs)
++    ... --parity-only   |   --bench-only --variants baseline,kq256
++"""
++from __future__ import annotations
++
++import argparse
++import os
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++EXE = ".exe" if os.name == "nt" else ""
++
++# (program, arguments) - every one synthetic; exit code 0 = pass
++PARITY = [
++    ("strata-device", []),
++    ("bf16_gemm_fallback_test", ["cublas"]),
++    ("bf16_gemm_fallback_test", ["fallback"]),
++    ("native_expert_parity", ["--synthetic", "q4_K/q5_1"]),
++    ("native_expert_parity", ["--synthetic", "q4_K/q8_0"]),
++    ("native_expert_parity", ["--synthetic", "q5_K/q8_0"]),
++    ("native_expert_parity", ["--synthetic", "q8_0/q8_0"]),
++    ("native_expert_parity", ["--q5_1-min"]),
++    ("mmvq_multi_parity", []),
++    ("prefill_mmq_kquant_test", []),
++    ("gr_parity", ["--selftest"]),
++    ("gdn_parity", ["--selftest"]),
++    ("qsa_parity", ["--selftest"]),
++    ("kv_q8_parity", []),
++    ("elementwise_parity", ["--selftest"]),
++    ("sampler_parity", ["--selftest"]),
++    ("router_top10_parity", ["--selftest"]),
++    ("rope_parity", ["--selftest"]),
++    ("quantize_act_parity", ["--selftest"]),
++    ("shared_expert_parity", ["--selftest"]),
++    ("bf16_gemv_parity", ["--selftest"]),
++    ("s_gemv_q8k_parity", ["--selftest"]),
++]
++
++
++class Tee:
++    def __init__(self, path):
++        self.f = open(path, "a", encoding="utf-8", errors="replace")
++
++    def __call__(self, line=""):
++        print(line, flush=True)
++        self.f.write(line + "\n")
++        self.f.flush()
++
++
++def smi(log):
++    r = subprocess.run(["nvidia-smi", "--query-gpu=index,name,compute_cap,driver_model.current,memory.used,"
++                        "memory.total,utilization.gpu,pcie.link.gen.max,pcie.link.width.max,"
++                        "pcie.link.gen.current,pcie.link.width.current", "--format=csv"],
++                       capture_output=True, text=True)
++    for line in r.stdout.strip().splitlines():
++        log("  " + line)
++    return r.stdout
++
++
++def find_cards():
++    r = subprocess.run(["nvidia-smi", "--query-gpu=index,compute_cap,name", "--format=csv,noheader"],
++                       capture_output=True, text=True)
++    cards = []
++    for line in r.stdout.strip().splitlines():
++        i, cc, name = [x.strip() for x in line.split(",", 2)]
++        cards.append((int(i), cc, name))
++    # the V100 first: it is the card this fork adds
++    return sorted(cards, key=lambda c: (c[1] != "7.0", c[0]))
++
++
++def parity(log, build: Path) -> list:
++    results = []
++    for idx, cc, name in find_cards():
++        log(f"\n==== parity tests on GPU {idx} ({name}, compute {cc}) alone")
++        env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=str(idx))
++        for prog, args in PARITY:
++            exe = build / (prog + EXE)
++            label = f"{prog} {' '.join(args)}".strip()
++            if not exe.exists():
++                log(f"  SKIP {label}: {exe} not built")
++                results.append((idx, label, "missing"))
++                continue
++            t0 = time.time()
++            try:
++                p = subprocess.run([str(exe), *args], env=env, capture_output=True, text=True, timeout=900,
++                                   encoding="utf-8", errors="replace")
++                rc, out = p.returncode, (p.stdout or "") + (p.stderr or "")
++            except subprocess.TimeoutExpired:
++                rc, out = -999, "TIMEOUT after 900 s"
++            verdict = "PASS" if rc == 0 else f"FAIL ({rc})"
++            log(f"  {verdict:10s} {label}  [{time.time() - t0:.1f} s]")
++            for line in out.strip().splitlines()[-25:]:
++                log("      | " + line)
++            results.append((idx, label, verdict))
++    log("\n==== parity summary")
++    for idx, label, v in results:
++        log(f"  GPU {idx}  {v:10s} {label}")
++    return results
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--log", default=str(ROOT / "v100_gputest.log"))
++    ap.add_argument("--config", default=str(ROOT / "strata-unsloth-ud-q4_k_xl.json"))
++    ap.add_argument("--build", default=str(ROOT / "build"))
++    ap.add_argument("--parity-only", action="store_true")
++    ap.add_argument("--bench-only", action="store_true")
++    ap.add_argument("--variants", help="passed to v100_bench.py")
++    a = ap.parse_args()
++    log = Tee(a.log)
++    log(f"==== v100_gputest {time.strftime('%Y-%m-%d %H:%M:%S')}")
++    log("  GPUs now (memory.used should be near 0 - nothing else running on them):")
++    smi(log)
++    if not a.bench_only:
++        parity(log, Path(a.build))
++    if not a.parity_only:
++        if not Path(a.config).exists():
++            log(f"  no config {a.config}: run v100\\1_setup_and_build.bat first")
++            return 1
++        cmd = [sys.executable, str(ROOT / "tools" / "v100_bench.py"), a.config,
++               "--log", str(ROOT / "v100_bench.log")]
++        if a.variants:
++            cmd += ["--variants", a.variants]
++        log("\n==== benchmark: " + " ".join(cmd))
++        rc = subprocess.run(cmd, cwd=str(ROOT)).returncode
++        log(f"  benchmark exit code {rc} (details in v100_bench.log)")
++    log("  GPUs after:")
++    smi(log)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/v100_setup.py b/tools/v100_setup.py
+new file mode 100644
+index 0000000..1fbec62
+--- /dev/null
++++ b/tools/v100_setup.py
+@@ -0,0 +1,132 @@
++"""V100 fork: set up UD-Q4_K_XL on an RTX 4070 Super + Tesla V100 PC, and build the GPU test programs.
++
++Uses NO GPU: it only asks nvidia-smi which cards are there, then runs setup (download/pack if needed, compile the
++engine for sm_70 + sm_89 with the CUDA 12.x toolkit, write the config) with --no-start, and compiles the parity
++test programs into the same build folder.  Everything is written to the log file (default v100_setup.log).
++
++    .venv\\Scripts\\python tools\\v100_setup.py                       (what v100\\1_setup_and_build.bat runs)
++    ... --context 65536 --gguf-dir D:\\models\\unsloth               (your own choices, passed to setup)
++"""
++from __future__ import annotations
++
++import argparse
++import os
++import shutil
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++WIN = os.name == "nt"
++
++# the GPU test programs the second script runs (all synthetic: no model needed); built next to the engine
++TEST_TARGETS = ["bf16_gemm_fallback_test", "native_expert_parity", "mmvq_multi_parity", "gr_parity", "gdn_parity",
++                "qsa_parity", "kv_q8_parity", "elementwise_parity", "sampler_parity", "router_top10_parity",
++                "rope_parity", "quantize_act_parity", "shared_expert_parity", "bf16_gemv_parity",
++                "s_gemv_q8k_parity", "prefill_mmq_kquant_test", "strata-device"]
++
++
++class Tee:
++    def __init__(self, path):
++        self.f = open(path, "a", encoding="utf-8", errors="replace")
++
++    def __call__(self, line=""):
++        print(line, flush=True)
++        self.f.write(line + "\n")
++        self.f.flush()
++
++
++def run_logged(cmd, log, env=None, cwd=None) -> int:
++    log("$ " + " ".join(str(c) for c in cmd))
++    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True,
++                         encoding="utf-8", errors="replace", env=env, cwd=cwd)
++    for line in p.stdout:
++        log(line.rstrip("\n"))
++    return p.wait()
++
++
++def gpus(log):
++    r = subprocess.run(["nvidia-smi", "--query-gpu=index,name,compute_cap,memory.total,driver_model.current,"
++                        "pci.bus_id", "--format=csv,noheader,nounits"], capture_output=True, text=True)
++    out = []
++    for line in r.stdout.strip().splitlines():
++        f = [x.strip() for x in line.split(",")]
++        if len(f) >= 4:
++            out.append({"index": int(f[0]), "name": f[1], "cc": f[2], "mib": f[3],
++                        "model": f[4] if len(f) > 4 else "?", "bus": f[5] if len(f) > 5 else "?"})
++            log(f"  GPU {f[0]}: {f[1]}, compute {f[2]}, {f[3]} MiB, driver model {out[-1]['model']}, bus {out[-1]['bus']}")
++    return out
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--log", default=str(ROOT / "v100_setup.log"))
++    ap.add_argument("--context", type=int, default=32768)
++    ap.add_argument("--gguf-dir")
++    ap.add_argument("--data-dir")
++    ap.add_argument("--gpus", help="override the order, e.g. 0,1 (the first is the main card)")
++    ap.add_argument("--skip-setup", action="store_true", help="only build the test programs")
++    a = ap.parse_args()
++    log = Tee(a.log)
++    log(f"==== v100_setup {time.strftime('%Y-%m-%d %H:%M:%S')}")
++    found = gpus(log)
++    if a.gpus:
++        order = a.gpus
++    else:
++        ada = [g for g in found if g["cc"].startswith("8.9")]
++        volta = [g for g in found if g["cc"] == "7.0"]
++        if not ada or not volta:
++            log("  could not find both an sm_89 card (RTX 4070 Super) and an sm_70 card (V100); pass --gpus A,B")
++            return 1
++        # the 4070 Super first: the V100 (32 GB) then carries the output head and the MTP draft layer, so the 12 GB
++        # card keeps more of its VRAM for experts (docs/V100.md)
++        order = f"{ada[0]['index']},{volta[0]['index']}"
++    log(f"  GPU order for the layer split: {order} (the first one is CUDA0)")
++    py = sys.executable
++    if not a.skip_setup:
++        cmd = [py, str(ROOT / "setup.py"), "--setup", "--build", "--yes", "--no-start", "--family", "unsloth",
++               "--model", "UD-Q4_K_XL", "--gpus", order, "--context", str(a.context), "--vision", "no",
++               "--experimental-speed-projection", "off"]
++        if a.gguf_dir:
++            cmd += ["--gguf-dir", a.gguf_dir]
++        if a.data_dir:
++            cmd += ["--data-dir", a.data_dir]
++        rc = run_logged(cmd, log, cwd=str(ROOT))
++        log(f"  setup exit code {rc}")
++        if rc != 0:
++            return rc
++    # the test programs, in setup's build folder (same configuration, so only they are compiled)
++    sys.path.insert(0, str(ROOT))
++    import setup as S                                      # noqa: E402
++    cmake, ninja = S.find_tool("cmake"), S.find_tool("ninja")
++    if not (ROOT / "build" / "CMakeCache.txt").exists() or cmake is None:
++        log("  no build/CMakeCache.txt (setup did not compile the engine?) - the test programs are not built")
++        return 1
++    jobs = str(max(2, (os.cpu_count() or 4) // 2))
++    build = [cmake, "--build", str(ROOT / "build"), "-j", jobs, "--target", *TEST_TARGETS]
++    if WIN:
++        vcvars = S.find_vcvars()
++        if vcvars is None:
++            log("  Visual Studio Build Tools not found")
++            return 1
++        bat = ROOT / "build-v100-tests.bat"
++        q = lambda c: " ".join(f'"{x}"' if " " in str(x) else str(x) for x in c)  # noqa: E731
++        bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{q(build)}\r\n', encoding="utf-8")
++        rc = run_logged(["cmd", "/c", str(bat)], log, cwd=str(ROOT))
++    else:
++        rc = run_logged(build, log, cwd=str(ROOT))
++    log(f"  test programs build exit code {rc}")
++    exe = ".exe" if WIN else ""
++    for t in TEST_TARGETS:
++        p = ROOT / "build" / (t + exe)
++        log(f"    {'ok     ' if p.exists() else 'MISSING'} {p}")
++    cfg = ROOT / "strata-unsloth-ud-q4_k_xl.json"
++    log(f"  config: {cfg} {'(present)' if cfg.exists() else '(MISSING)'}")
++    if cfg.exists():
++        log(cfg.read_text(encoding="utf-8"))
++    return rc
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/v100/1_setup_and_build.bat b/v100/1_setup_and_build.bat
+new file mode 100644
+index 0000000..62fa55b
+--- /dev/null
++++ b/v100/1_setup_and_build.bat
+@@ -0,0 +1,18 @@
++@echo off
++rem V100 fork, step 1 - uses NO GPU (safe while your other server runs on both cards):
++rem   finds the RTX 4070 Super and the Tesla V100 with nvidia-smi, runs setup for Unsloth's UD-Q4_K_XL
++rem   (download / pack if needed, compile the engine for sm_70 + sm_89 with CUDA 12.9, write the config, no start),
++rem   then compiles the GPU test programs.  Everything is logged to v100_setup.log in the Strata folder.
++rem   Extra options are passed on, e.g.:  1_setup_and_build.bat --context 65536 --gguf-dir D:\models\ud-q4
++setlocal
++cd /d "%~dp0.."
++if not exist ".venv\Scripts\python.exe" call START-HERE.bat --check < nul
++if not exist ".venv\Scripts\python.exe" (
++  echo Python environment missing - run START-HERE.bat --check once, then this again.
++  pause
++  exit /b 1
++)
++".venv\Scripts\python.exe" tools\v100_setup.py %*
++echo.
++echo Done. Send v100_setup.log (in the Strata folder) back for review.
++pause
+diff --git a/v100/2_gpu_tests.bat b/v100/2_gpu_tests.bat
+new file mode 100644
+index 0000000..36dc490
+--- /dev/null
++++ b/v100/2_gpu_tests.bat
+@@ -0,0 +1,14 @@
++@echo off
++rem V100 fork, step 2 - USES BOTH GPUs: stop your other GPU server first.
++rem   Kernel parity tests on each card alone (V100 first), then the speed / quality benchmark of
++rem   several engine settings (each loads the model: ~30-40 minutes in all).
++rem   Logs: v100_gputest.log, v100_bench.log and v100_bench.json in the Strata folder.
++rem   Options:  --parity-only   --bench-only   --variants baseline,kq256
++setlocal
++cd /d "%~dp0.."
++echo This uses both GPUs for ~30-40 minutes. Make sure nothing else is running on them.
++pause
++".venv\Scripts\python.exe" tools\v100_gputest.py %*
++echo.
++echo Done. Send v100_gputest.log and v100_bench.log back for review.
++pause
+diff --git a/v100/3_start_server.bat b/v100/3_start_server.bat
+new file mode 100644
+index 0000000..1de1a62
+--- /dev/null
++++ b/v100/3_start_server.bat
+@@ -0,0 +1,7 @@
++@echo off
++rem V100 fork, step 3 - starts the Strata server on both GPUs with the config step 1 wrote (http://127.0.0.1:8080).
++rem (The same as the start script setup wrote, start-unsloth-UD-Q4_K_XL.bat.)  Extra options go to the server.
++setlocal
++cd /d "%~dp0.."
++".venv\Scripts\python.exe" -m serve.server --engine strata --config strata-unsloth-ud-q4_k_xl.json %*
++pause

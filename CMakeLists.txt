@@ -107,8 +107,20 @@ if(STRATA_ENABLE_CUDA)
                       "CUDA 12.8 crashed on long prompts on these cards (issues #220, #224). Use CUDA 13.0 or newer.")
     endif()
   endforeach()
+  if(STRATA_EXPERIMENTAL_SM60)   # CUDA 12.x warns on every file that sm_70 support will go; it is known
+    string(APPEND CMAKE_CUDA_FLAGS " -Wno-deprecated-gpu-targets")
+  endif()
   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
-  set(_strata_gpu_runtime_target CUDA::cudart)
+  # V100 fork: ONE CUDA runtime on Windows.  A C++ executable that links CUDA objects also gets CUDA's implicit link
+  # libraries from the compiler probe (cudadevrt + cudart_static), whatever CMAKE_CUDA_RUNTIME_LIBRARY says; with
+  # CUDA::cudart (the DLL's import library) beside it, MSVC refuses the link: LNK2005 for every cuda* symbol, LNK1169
+  # (CUDA 12.9 + CMake 4.4).  The static runtime is nvcc's own default, so link that one everywhere instead (cuBLAS
+  # stays a DLL; it does not depend on the runtime DLL).
+  if(MSVC)
+    set(_strata_gpu_runtime_target CUDA::cudart_static)
+  else()
+    set(_strata_gpu_runtime_target CUDA::cudart)
+  endif()
   set(_strata_gpu_blas_target CUDA::cublas)
   set(_strata_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 elseif(STRATA_ENABLE_HIP)
@@ -272,7 +284,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if((STRATA_BUILD_TESTS OR STRATA_PARITY_PROMPT_ATTN) AND STRATA_ENABLE_CUDA)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
     target_include_directories(qsa_prompt_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels CUDA::cudart)
+    target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
   # the QSA selection (block scores on the warp kernel and the tensor-core one, top-k): a GPU bench with a
   # scorer-vs-scorer comparison and an FP64 accuracy gate (synthetic, no model); the ctest runs a 32K context under a
@@ -401,6 +413,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  # V100 fork: the prompt path's BF16 GEMM on this GPU - cuBLAS's GemmEx, or the FP32 fallback kernel Volta needs
+  # when cuBLAS has no BF16 GEMM for it (GPU, synthetic, no model)
+  if(STRATA_ENABLE_CUDA)
+    add_executable(bf16_gemm_fallback_test tests/cuda/bf16_gemm_fallback_test.cpp)
+    target_link_libraries(bf16_gemm_fallback_test PRIVATE strata_prefill ${_strata_gpu_runtime_target})
+  endif()
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
@@ -880,7 +898,7 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
-    if(STRATA_BUILD_TESTS AND STRATA_MMQ_KQUANTS)
+    if(STRATA_MMQ_KQUANTS)   # V100 fork: built whenever the kernels are (the GPU test script runs it)
       # the UD-Q4_K_XL expert formats through MMQ against ggml's dequantized weights (synthetic, a few seconds)
       add_executable(prefill_mmq_kquant_test tests/cuda/prefill_mmq_kquant_test.cpp)
       target_link_libraries(prefill_mmq_kquant_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})

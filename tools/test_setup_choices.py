@@ -101,10 +101,13 @@ class ExperimentalSm60(unittest.TestCase):
 
     def test_the_gate(self):
         with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM60": ""}):
-            for arch in ("60", "61", "70"):
+            for arch in ("60", "61"):
                 p = setup.gpu_problem(self.card(arch))
                 self.assertIn("not supported", p)
                 self.assertIn("STRATA_EXPERIMENTAL_SM60=1", p)
+            self.assertIsNone(setup.gpu_problem(self.card("70")))   # V100 fork: Volta admitted by default
+        with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM60": "0"}):
+            self.assertIn("not supported", setup.gpu_problem(self.card("70")))
             self.assertNotIn("STRATA_EXPERIMENTAL_SM60", setup.gpu_problem(self.card("52")))
             self.assertIsNone(setup.gpu_problem(self.card("75")))
         with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM60": "1"}):
@@ -115,7 +118,7 @@ class ExperimentalSm60(unittest.TestCase):
 
     def test_the_build_flag(self):
         self.assertEqual(setup.engine_defs([61]), ["-DSTRATA_EXPERIMENTAL_SM60=ON"])
-        self.assertEqual(setup.engine_defs([70, 86]), ["-DSTRATA_EXPERIMENTAL_SM60=ON"])
+        self.assertEqual(setup.engine_defs([70, 86]), ["-DSTRATA_EXPERIMENTAL_SM60=ON", "-DSTRATA_MMQ_KQUANTS=ON"])
         self.assertEqual(setup.engine_defs([75, 86, 120]), [])
 
     def test_find_nvcc_below(self):

@@ -35,6 +35,75 @@
 namespace strata::prefill {
 namespace {
 
+#if !defined(__HIPCC__)
+// ---- V100 (sm_70) support: a BF16 x BF16 -> FP32 GEMM that needs no BF16 hardware ---------------------------------
+// cuBLAS's BF16 GemmEx is an Ampere-and-newer feature on some toolkits; Volta (and Pascal) may answer
+// CUBLAS_STATUS_NOT_SUPPORTED / ARCH_MISMATCH instead of a product.  BF16 -> FP32 is exact (a 16-bit shift), so this
+// kernel computes the same sum as an FP32 GEMM on the widened inputs, with FP32 accumulation: Y[t, n] = beta*Y[t, n]
+// + sum_k X[t, k] W[n, k].  64 x 64 output tile per block, 256 threads, 4 x 4 outputs per thread, K in steps of 16.
+// Only the prompt path's dense BF16 projections reach it (a small share of a chunk's time), never the decode.
+constexpr int kBfTile = 64, kBfK = 16;
+__global__ void __launch_bounds__(256) bf16_gemm_fallback_kernel(const uint16_t* __restrict__ X,
+                                                                  const uint16_t* __restrict__ W, float* __restrict__ Y,
+                                                                  int T, int N, int K, int ldy, float beta) {
+    __shared__ float xs[kBfK][kBfTile + 1];
+    __shared__ float ws[kBfK][kBfTile + 1];
+    const int tid = threadIdx.x;
+    const int t0 = blockIdx.y * kBfTile, n0 = blockIdx.x * kBfTile;
+    const int tr = (tid / 16) * 4, nc = (tid % 16) * 4;   // this thread's 4 x 4 outputs
+    float acc[4][4] = {};
+    for (int k0 = 0; k0 < K; k0 += kBfK) {
+        // 64 rows x 16 k of X and of W: 1024 values each, 4 per thread
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int e = tid + i * 256;
+            const int r = e / kBfK, kk = e % kBfK;
+            const int k = k0 + kk;
+            const int t = t0 + r, n = n0 + r;
+            xs[kk][r] = (t < T && k < K) ? __uint_as_float((uint32_t) X[(int64_t) t * K + k] << 16) : 0.0f;
+            ws[kk][r] = (n < N && k < K) ? __uint_as_float((uint32_t) W[(int64_t) n * K + k] << 16) : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < kBfK; ++kk) {
+            float a[4], b[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { a[i] = xs[kk][tr + i]; b[i] = ws[kk][nc + i]; }
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int t = t0 + tr + i;
+        if (t >= T) continue;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int n = n0 + nc + j;
+            if (n >= N) continue;
+            float* y = Y + (int64_t) t * ldy + n;
+            *y = beta != 0.0f ? fmaf(beta, *y, acc[i][j]) : acc[i][j];
+        }
+    }
+}
+
+// Per device: does cuBLAS run BF16 GemmEx here?  1 yes, 0 no (use the kernel above), -1 not asked yet.
+// STRATA_BF16_GEMM_FALLBACK=1 forces the kernel on any card (the parity arm), =0 forbids it.
+int g_bf16_cublas[64] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+int bf16_fallback_env() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_BF16_GEMM_FALLBACK");
+        return e && *e ? std::atoi(e) : -1;
+    }();
+    return v;
+}
+#endif
+
 void ck(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) {
         std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d\n", what, (int) s);
@@ -366,11 +435,40 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         return;
     }
 #endif
+#if !defined(__HIPCC__)
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int* known = (dev >= 0 && dev < 64) ? &g_bf16_cublas[dev] : nullptr;
+    const int env = bf16_fallback_env();
+    if (env == 1 || (env != 0 && known && *known == 0)) {
+        const dim3 grid((unsigned) ((N + kBfTile - 1) / kBfTile), (unsigned) ((T + kBfTile - 1) / kBfTile));
+        bf16_gemm_fallback_kernel<<<grid, 256, 0, (cudaStream_t) stream_>>>(X, W, Y, (int) T, (int) N, (int) K,
+                                                                            (int) ldy, beta);
+        if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) {
+            std::fprintf(stderr, "prefill gemm: bf16 fallback kernel: %s\n", cudaGetErrorString(e));
+            std::exit(1);
+        }
+        return;
+    }
+#endif
     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
-    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
-                    CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
-       "cublasGemmEx");
+    const cublasStatus_t st = cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T,
+                                           (int) K, &alpha, W, CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta,
+                                           Y, CUDA_R_32F, (int) ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+#if !defined(__HIPCC__)
+    if (st != CUBLAS_STATUS_SUCCESS && known && *known != 1 && env != 0 &&
+        (st == CUBLAS_STATUS_NOT_SUPPORTED || st == CUBLAS_STATUS_ARCH_MISMATCH)) {
+        // Volta / Pascal: no BF16 GemmEx in this cuBLAS - the kernel above from now on, for this device.  The call
+        // was rejected before anything ran, so Y is untouched and the same product is simply made by the kernel.
+        std::fprintf(stderr, "prefill gemm: device %d: cuBLAS has no BF16 GEMM here (status %d); using the FP32 "
+                             "fallback kernel for the BF16 projections\n", dev, (int) st);
+        *known = 0;
+        bf16(X, W, Y, T, N, K, ldy, beta);
+        return;
+    }
+    if (st == CUBLAS_STATUS_SUCCESS && known && *known < 0) *known = 1;
+#endif
+    ck(st, "cublasGemmEx");
 }
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,

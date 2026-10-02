@@ -427,6 +427,10 @@ public:
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
     void close();
+    /// V100 fork: never ask the driver to page-lock the RAM copy (`cudaHostAlloc`); it is then ordinary memory
+    /// locked in the working set.  A layer split under WDDM sets this: tens of GiB mapped into two GPU contexts
+    /// left WDDM refusing later allocations (the same reason the arena's pinning is capped there).
+    void set_no_pagelock(bool v) { no_pagelock_ = v; }
 
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
@@ -542,6 +546,7 @@ private:
     int64_t n_expert_ = 0;
     uint64_t mapped_bytes_ = 0;
     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
+    bool no_pagelock_ = false;
     void* complement_arena_ = nullptr;
     const uint8_t* complement_host_ = nullptr;
     const uint8_t* complement_device_ = nullptr;

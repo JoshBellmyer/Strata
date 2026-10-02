@@ -1,5 +1,8 @@
 <h1 align="center">Strata</h1>
 
+> **This fork:** Tesla V100 (sm_70) support and a layer-split RAM-budget mode for Unsloth's UD-Q4_K_XL on an
+> RTX 4070 Super + Tesla V100 + 96 GB PC - see [docs/V100.md](docs/V100.md) and the scripts in `v100/`.
+
 <p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>
 one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to install</p>
 

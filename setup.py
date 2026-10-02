@@ -394,13 +394,19 @@ def experimental_sm60() -> bool:
     return os.environ.get("STRATA_EXPERIMENTAL_SM60", "").strip() == "1"
 
 
+def volta_ok(arch) -> bool:
+    """V100 fork: Volta (sm_70, Tesla V100 / Titan V) is supported here without the env switch (the engine is then
+    compiled locally with a CUDA 12.x toolkit for sm_70 + the other cards).  STRATA_EXPERIMENTAL_SM60=0 opts out."""
+    return int(arch) == 70 and os.environ.get("STRATA_EXPERIMENTAL_SM60", "").strip() != "0"
+
+
 def sm60_card(arch) -> bool:
     return 60 <= int(arch) <= 70
 
 
 def gpu_problem(g, together=False):
     """Why Strata cannot use this card, in plain words (None: it can)."""
-    if int(g["arch"]) < 75 and not (sm60_card(g["arch"]) and experimental_sm60()):
+    if int(g["arch"]) < 75 and not (sm60_card(g["arch"]) and (experimental_sm60() or volta_ok(g["arch"]))):
         return (f"not supported - older than the RTX 20 series (compute capability {cc(g)}; Strata needs 7.5 or "
                 "newer" + ("; STRATA_EXPERIMENTAL_SM60=1 tries the community build for it" if sm60_card(g["arch"])
                           else "") + ")")
@@ -1425,7 +1431,12 @@ def source_hash(parts) -> str:
 
 def engine_defs(archs) -> list:
     """Extra CMake definitions for the engine: the experimental Pascal/Volta build (#295) for cards below sm_75."""
-    return ["-DSTRATA_EXPERIMENTAL_SM60=ON"] if min(int(x) for x in archs) < 75 else []
+    # V100 fork: a Volta build (the V100 + RTX 4070 Super PC) also gets the MMQ prompt kernels for UD-Q4_K_XL's
+    # Q4_K / Q5_K / Q5_1 experts (4x less GPU time than dequantize + cuBLAS; with the SSD out of the prompt path the
+    # GPU time counts).  STRATA_MMQ_KQUANTS=0 in the config's env switches them off at run time.
+    if min(int(x) for x in archs) < 75:
+        return ["-DSTRATA_EXPERIMENTAL_SM60=ON"] + (["-DSTRATA_MMQ_KQUANTS=ON"] if 70 in {int(x) for x in archs} else [])
+    return []
 
 
 def prebuilt_vision(meta: dict, gpu: dict, vision: str) -> str:
@@ -2365,19 +2376,24 @@ def main() -> int:
     budget = None
     if MODELS[model].get("budget"):
         # Unsloth's UD-Q4_K_XL: a RAM budget of experts, the rest from the GGUF on the SSD - not the low-RAM mode (no
-        # experts.bin: it would be another 77 GB on the disk), and one GPU (the budget mode has no layer split)
+        # experts.bin: it would be another 77 GB on the disk); several GPUs share it by a layer split (V100 fork)
         warn(f"{model} is EXPERIMENTAL (docs/UNSLOTH_Q4.md): most of its experts are read from the SSD while it "
              "answers, so it is several times slower than the 2-3-bit models; quality checked against llama.cpp")
         if ram < MODELS[model]["ram_gb"]:
             fail(f"{model} needs {MODELS[model]['ram_gb']} GB of RAM or more; this PC has {ram:.0f} GB",
                  "choose one of the 2-3-bit models")
         budget = resident_budget_gib(model, ram)
-        ok(f"RAM budget: {budget} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
+        ok(f"RAM budget: up to {budget} GiB of {model}'s experts in RAM (the ones no GPU holds), the rest read from "
+           "the model files on the SSD")
         if a.low_ram not in ("auto", "off"):
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
-        if multi:
-            warn(f"{model} runs on one GPU: using " + gpu_name(gpu) + " only")
+        if multi and os.environ.get("STRATA_BUDGET_ONE_GPU", "").strip() == "1":
+            warn(f"{model} on one GPU (STRATA_BUDGET_ONE_GPU=1): using " + gpu_name(gpu) + " only")
             multi, sel, chosen = [], [gpu["index"]], [gpu]
+        elif multi:
+            # V100 fork: the engine's RAM-budget mode runs on a layer split (the RAM copy holds what no GPU holds)
+            ok(f"{model} shares its layers across " + " + ".join(gpu_name(x) for x in chosen) +
+               ": every GPU's expert cache comes out of the RAM budget's work")
     low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
                                   (a.low_ram == "auto" and low_ram_needed(model, ram)))
     if low_ram and multi:

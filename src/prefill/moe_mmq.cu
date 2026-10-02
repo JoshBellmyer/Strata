@@ -90,6 +90,15 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 bool built() { return true; }
 
 bool supported(int t) {
+#ifdef STRATA_MMQ_KQUANTS
+    // V100 fork: STRATA_MMQ_KQUANTS=0 sends the Q4_K / Q5_K / Q5_1 experts back to the FP16 dequantize + cuBLAS
+    // path (the A/B arm of a build that has the MMQ kernels)
+    static const bool kq_off = [] {
+        const char* v = std::getenv("STRATA_MMQ_KQUANTS");
+        return v != nullptr && v[0] == '0';
+    }();
+    if (kq_off && (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q5_1)) return false;
+#endif
     switch ((ggml_type) t) {
         case GGML_TYPE_Q2_0:
 #ifdef STRATA_ORCA_Q4KS_MMQ

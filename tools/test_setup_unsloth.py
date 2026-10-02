@@ -7,6 +7,8 @@ engine version it needs, one GPU, no images.  Mocked - no GPU, no downloads, not
 from __future__ import annotations
 
 import contextlib
+import os
+from unittest import mock
 import hashlib
 import io
 import json
@@ -243,11 +245,26 @@ class Main(unittest.TestCase):
         self.assertIn("needs 48 GB of RAM or more", out)
         self.assertEqual(self.downloads, [])
 
-    def test_one_gpu_and_no_images(self):
+    def test_two_gpus_and_no_images(self):
+        # V100 fork: the RAM-budget mode keeps the layer split (STRATA_BUDGET_ONE_GPU=1 restores one GPU)
         code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1", "--vision", "yes", "--low-ram", "on"],
                                    n_gpus=2)
         self.assertEqual(code, 0, out)
-        self.assertIn("runs on one GPU", out)
+        self.assertIn("shares its layers across", out)
+        self.assertEqual(cfg["gpu"], [0, 1])
+        self.assertEqual(cfg["layer_split"], "auto")
+        self.assertIn("images are not available with UD-Q4_K_XL", out)
+        self.assertIn("--low-ram on does not apply", out)
+        self.assertNotIn("--vision", cfg["args"])
+        self.assertNotIn("--mmap-experts", cfg["args"])
+        self.assertFalse(any("--experts-bin" in r for r in self.runs))
+
+    def test_one_gpu_and_no_images(self):
+        with mock.patch.dict(os.environ, {"STRATA_BUDGET_ONE_GPU": "1"}):
+            code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1", "--vision", "yes", "--low-ram", "on"],
+                                       n_gpus=2)
+        self.assertEqual(code, 0, out)
+        self.assertIn("on one GPU", out)
         self.assertIn("images are not available with UD-Q4_K_XL", out)
         self.assertIn("--low-ram on does not apply", out)
         self.assertNotIn("layer_split", cfg)

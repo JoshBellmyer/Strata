@@ -126,14 +126,22 @@ using Clock = std::chrono::steady_clock;
 // reads the file.  Swaps that need no exchange (`out` in the lend region is held in RAM already; or `in` is not) go
 // on as before; ones beyond the buffers' room wait for a later round.  Runs on the adaptive tier's thread while the
 // GPU commits and drafts: the copies back are on its stream, and waited for before the refills are queued.
-template <class Swap>
-bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::ExpertCache& cache,
-                          const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
-                          cudaStream_t stream) {
+// V100 + layer split: `owner(layer)` names the cache that holds the layer's slots, its device and the stream to copy
+// on (a layer split's later stages own their layers' slots; the slot numbers in `host_res` index THAT cache).  The
+// one-GPU call keeps CUDA0's cache, device -1 (the current one) and `stream`.
+struct SwapOwner {
+    strata::core::ExpertCache* cache = nullptr;
+    int dev = -1;
+    cudaStream_t stream = nullptr;
+};
+template <class Swap, class Owner>
+bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res,
+                          int64_t n_expert, std::vector<Swap>& swaps, Owner&& owner) {
     if (!src.complement_ready() || swaps.empty()) return true;
     struct Staged { int32_t layer, in, out; int64_t q; };
     std::vector<Staged> staged;
     std::vector<Swap> kept;
+    std::vector<SwapOwner> used;   // every stream a copy went on, synchronized below
     kept.reserve(swaps.size());
     for (const Swap& s : swaps) {
         if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
@@ -141,20 +149,36 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::Exp
         if (q >= src.exchange_capacity()) continue;
         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
         if (slot < 0) continue;
-        if (cudaMemcpyAsync(src.exchange_buffer(q), cache.device_slot(slot),
+        const SwapOwner w = owner(s.layer);
+        if (w.cache == nullptr) continue;
+        const strata::core::OnDevice on(w.dev);
+        if (cudaMemcpyAsync(src.exchange_buffer(q), w.cache->device_slot(slot),
                             (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), cudaMemcpyDeviceToHost,
-                            stream) != cudaSuccess)
+                            w.stream) != cudaSuccess)
             return false;
+        bool seen = false;
+        for (const SwapOwner& u : used) seen = seen || (u.dev == w.dev && u.stream == w.stream);
+        if (!seen) used.push_back(w);
         staged.push_back({s.layer, s.in, s.out, q});
         kept.push_back(s);
     }
     if (!staged.empty()) {
-        if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
+        for (const SwapOwner& u : used) {
+            const strata::core::OnDevice on(u.dev);
+            if (cudaStreamSynchronize(u.stream) != cudaSuccess) return false;
+        }
         for (const Staged& x : staged)
             if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) return false;
     }
     swaps.swap(kept);
     return true;
+}
+template <class Swap>
+bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::ExpertCache& cache,
+                          const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
+                          cudaStream_t stream) {
+    return resident_stage_swaps(src, host_res, n_expert, swaps,
+                                [&](int32_t) { return SwapOwner{&cache, -1, stream}; });
 }
 
 struct Options {
@@ -1320,10 +1344,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
         return 2;
     }
+    // V100 support: the RAM-budget mode (--resident-budget-gib, Unsloth's UD-Q4_K_XL) runs on a layer split - the
+    // RAM copy then holds what NO stage's cache holds (every stage's pairs are passed to the complement planner).
+    // The plain resident mode (--resident-experts, with its prompt-path lend region) and the helper caches stay
+    // one-GPU: the lend region is CUDA0's alone.
     if (o.resident_cpu_experts &&
-        (!o.layer_split.empty() || o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
-         o.expert_cache_remote[2] > 0)) {
-        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
+        ((!o.layer_split.empty() && o.resident_budget == 0) || o.expert_cache_remote[0] > 0 ||
+         o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)) {
+        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits (except with "
+                             "--resident-budget-gib) or remote expert caches\n");
         return 2;
     }
     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
@@ -3757,7 +3786,25 @@ int main(int argc, char** argv) {
             const int64_t k = plan_lend(chunk);
             if (k > 0) lend_from = xcache.slots() - k;
         }
-        if (src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
+        // a layer split: the later stages' caches hold their layers' experts on their own GPUs - none of those is
+        // copied into RAM (the budget goes to the hottest experts no GPU holds)
+        std::vector<std::pair<int32_t, int32_t>> stage_pairs;
+        for (auto& st : stages)
+            for (int64_t l = st->lb; l < st->le; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (st->cache.slot_of(l, e) != strata::core::kNotResident)
+                        stage_pairs.emplace_back((int32_t) l, (int32_t) e);
+        if (!stage_pairs.empty())
+            std::fprintf(stderr, "strata generate: resident RAM mode on a layer split: %zu experts held by the later "
+                                 "stages' GPUs are left out of the RAM copy\n", stage_pairs.size());
+        // under WDDM a split keeps the RAM copy out of the GPU contexts (locked in RAM instead of page-locked by the
+        // driver; STRATA_ARENA_PIN_GIB=0 allows it again, as for the arena)
+        if (multi_gpu && under_wddm() && strata::core::arena_pin_cap_gib() != 0) {
+            src.set_no_pagelock(true);
+            std::fprintf(stderr, "strata generate: layer split under WDDM: the RAM copy of the experts is locked in "
+                                 "RAM, not page-locked by the GPU driver\n");
+        }
+        if (src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from, o.resident_headroom,
                                      o.resident_budget, &profile)) {
             if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
                 !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
@@ -4453,7 +4500,13 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
-            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
+            // a layer split: each evicted expert is copied back from the cache (and device) that owns its layer
+            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, [&](int32_t layer) {
+                    const int stn = multi_gpu ? stage_of(layer) : 0;
+                    GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
+                    return gs ? SwapOwner{&gs->cache, gs->dev, gs->adapt_stream} : SwapOwner{&xcache, -1, adapt_stream};
+                }))
+                return false;
             bool main_live = false;
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;

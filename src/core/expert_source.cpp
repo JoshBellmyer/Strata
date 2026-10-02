@@ -1121,7 +1121,8 @@ bool FileExpertSource::pin_cache_complement(
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         std::fflush(stderr);
-        if (pin) {
+        if (pin && no_pagelock_) note = "page-locking skipped (a layer split under WDDM)";
+        if (pin && !no_pagelock_) {
             const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
                                                          cudaHostAllocMapped | cudaHostAllocPortable);
             if (allocated == cudaSuccess) {
@@ -1344,7 +1345,8 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     }
     const size_t total = (size_t) n * (size_t) blob;
     void* p = nullptr;
-    if (cudaHostAlloc(&p, total, cudaHostAllocDefault) == cudaSuccess && p != nullptr) {
+    // Portable: a layer split copies evicted experts back from the later stages' GPUs into these too (V100 fork)
+    if (cudaHostAlloc(&p, total, cudaHostAllocPortable) == cudaSuccess && p != nullptr) {
         xstage_pinned_ = true;
     } else {
         (void) cudaGetLastError();
