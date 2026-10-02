@@ -91,11 +91,12 @@ bool built() { return true; }
 
 bool supported(int t) {
 #ifdef STRATA_MMQ_KQUANTS
-    // V100 fork: STRATA_MMQ_KQUANTS=0 sends the Q4_K / Q5_K / Q5_1 experts back to the FP16 dequantize + cuBLAS
-    // path (the A/B arm of a build that has the MMQ kernels)
+    // V100 fork: OFF unless STRATA_MMQ_KQUANTS=1.  prefill_mmq_kquant_test left output rows unwritten on both the V100
+    // and the RTX 4070 Super (2026-10-02, its second batch), so the Q4_K / Q5_K / Q5_1 experts take the FP16 dequantize
+    // + cuBLAS path (measured ~10% slower prompts, known correct) until that is understood.
     static const bool kq_off = [] {
         const char* v = std::getenv("STRATA_MMQ_KQUANTS");
-        return v != nullptr && v[0] == '0';
+        return v == nullptr || v[0] != '1';
     }();
     if (kq_off && (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q5_1)) return false;
 #endif

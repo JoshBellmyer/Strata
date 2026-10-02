@@ -65,15 +65,18 @@ VARIANTS = {
                 {"--pool-affinity": "p-cores"}, {}, None),
     "own_buffers": ("every GPU keeps its own prompt buffers (no loan from the expert caches)", {},
                     {"STRATA_SPLIT_OWN": "1"}, None),
-    "no_mmq_kq": ("prompt experts by FP16 dequantize + cuBLAS instead of the MMQ kernels", {},
-                  {"STRATA_MMQ_KQUANTS": "0"}, None),
+    "mmq_kq": ("prompt experts by the MMQ kernels (opt-in: their test left rows unwritten) instead of FP16 + cuBLAS",
+               {}, {"STRATA_MMQ_KQUANTS": "1"}, None),
+    "v100_first_pcores": ("the V100 first, CPU pool on the P-cores and their SMT siblings (11 workers)",
+                          {"--pool-affinity": "auto", "--pool-workers": "11"}, {}, swap_gpus),
     "miss300": ("layer split placement with a higher CPU-miss cost (Q4 experts on a 6P+8E AVX2 CPU)", {},
                 {"STRATA_SPLIT_MISS_MS": "300"}, None),
     "v100_first": ("the V100 as the first GPU (the 4070S then holds the head and the draft layer)", {}, {},
                    swap_gpus),
     "v100_only": ("the V100 alone (what upstream Strata would do: one GPU)", {}, {}, one_gpu(1)),
 }
-DEFAULT_ORDER = ["baseline", "kq256", "pcores", "own_buffers", "no_mmq_kq", "miss300", "v100_first", "v100_only"]
+# run 2 (2026-10-02): after the RAM-copy fix - the CPU pool and the card order are the open questions
+DEFAULT_ORDER = ["baseline", "pcores", "pcores6", "v100_first", "v100_first_pcores", "v100_only"]
 
 
 class Log:

@@ -88,8 +88,20 @@ def main() -> int:
         cmd = [py, str(ROOT / "setup.py"), "--setup", "--build", "--yes", "--no-start", "--family", "unsloth",
                "--model", "UD-Q4_K_XL", "--gpus", order, "--context", str(a.context), "--vision", "no",
                "--experimental-speed-projection", "off"]
-        if a.gguf_dir:
-            cmd += ["--gguf-dir", a.gguf_dir]
+        gguf_dir = a.gguf_dir
+        old_cfg = ROOT / "strata-unsloth-ud-q4_k_xl.json"
+        if not gguf_dir and old_cfg.exists():
+            # a run again (another --context): the model files stay where the last setup found them - without this,
+            # setup looks in Strata-data\models and would download the 111 GB again
+            import json
+            args = json.loads(old_cfg.read_text(encoding="utf-8-sig")).get("args", [])
+            if "--native" in args:
+                native = Path(args[args.index("--native") + 1])
+                if native.exists():
+                    gguf_dir = str(native.parent)
+                    log(f"  model files: {gguf_dir} (from the existing config)")
+        if gguf_dir:
+            cmd += ["--gguf-dir", gguf_dir]
         if a.data_dir:
             cmd += ["--data-dir", a.data_dir]
         rc = run_logged(cmd, log, cwd=str(ROOT))
@@ -123,6 +135,18 @@ def main() -> int:
         log(f"    {'ok     ' if p.exists() else 'MISSING'} {p}")
     cfg = ROOT / "strata-unsloth-ud-q4_k_xl.json"
     log(f"  config: {cfg} {'(present)' if cfg.exists() else '(MISSING)'}")
+    if cfg.exists():
+        # measured on this PC (2026-10-02, v100_bench run 2): the CPU expert pool on the P-cores and their SMT
+        # siblings, without the E-cores - 43.3 vs 41.0 tok/s, ahead in 4 of 6 prompts
+        import json
+        c = json.loads(cfg.read_text(encoding="utf-8-sig"))
+        for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11")):
+            if flag in c["args"]:
+                c["args"][c["args"].index(flag) + 1] = val
+            else:
+                c["args"] += [flag, val]
+        cfg.write_text(json.dumps(c, indent=1), encoding="utf-8")
+        log("  tuned for this PC: --pool-affinity auto --pool-workers 11")
     if cfg.exists():
         log(cfg.read_text(encoding="utf-8"))
     return rc

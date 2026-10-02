@@ -2437,7 +2437,11 @@ int main(int argc, char** argv) {
         while (st < (int) split_at.size() && l >= split_at[(size_t) st]) ++st;
         return st;
     };
+    // V100 fork: the whole model's ranking, kept for the RAM-budget mode on a split (below the split, `profile` is
+    // CUDA0's share only; ranking the RAM copy by that left every later stage's non-GPU expert on the files)
+    std::vector<std::pair<int32_t, int32_t>> profile_all;
     if (multi_gpu) {
+        profile_all = profile;
         std::vector<std::pair<int32_t, int32_t>> mine;
         for (const auto& pr : profile) {
             const int st = stage_of(pr.first);
@@ -3805,7 +3809,7 @@ int main(int argc, char** argv) {
                                  "RAM, not page-locked by the GPU driver\n");
         }
         if (src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from, o.resident_headroom,
-                                     o.resident_budget, &profile)) {
+                                     o.resident_budget, multi_gpu ? &profile_all : &profile)) {
             if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
                 !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());

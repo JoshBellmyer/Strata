@@ -1119,7 +1119,8 @@ bool FileExpertSource::pin_cache_complement(
     };
     if (bytes > 0) {
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
-                     (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
+                     (double) bytes / 1073741824.0,
+                     pin && !no_pagelock_ ? "page-locked" : pin ? "locked resident" : "pageable resident");
         std::fflush(stderr);
         if (pin && no_pagelock_) note = "page-locking skipped (a layer split under WDDM)";
         if (pin && !no_pagelock_) {

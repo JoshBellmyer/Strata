@@ -70,10 +70,10 @@ index 0da642f..1229072 100644
  
 diff --git a/docs/V100.md b/docs/V100.md
 new file mode 100644
-index 0000000..60575b0
+index 0000000..ef6271b
 --- /dev/null
 +++ b/docs/V100.md
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,143 @@
 +# Tesla V100 + RTX 4070 Super + 96 GB RAM (this fork)
 +
 +This fork runs Unsloth's **UD-Q4_K_XL** of Qwen3.8-Flash-Next ([UNSLOTH_Q4.md](UNSLOTH_Q4.md)) on one specific PC:
@@ -130,10 +130,10 @@ index 0000000..60575b0
 +- **setup.py**: Volta is admitted without `STRATA_EXPERIMENTAL_SM60=1` (`=0` opts out). The Unsloth model keeps both
 +  GPUs (`STRATA_BUDGET_ONE_GPU=1` restores the old one-GPU behavior). The engine is compiled locally for
 +  `sm_70;sm_89` with the CUDA 12.x toolkit (`-DSTRATA_EXPERIMENTAL_SM60=ON`, chosen by setup).
-+- **The prompt path's MMQ kernels for Q4_K / Q5_K / Q5_1 experts are compiled in** (`-DSTRATA_MMQ_KQUANTS=ON`,
-+  added by setup for a Volta build): 4x less GPU time than dequantizing the experts to FP16. Upstream left them off
-+  because its prompts waited for the SSD either way, which no longer happens here. `STRATA_MMQ_KQUANTS=0` in the
-+  config's `env` switches back (bench variant `no_mmq_kq`); `prefill_mmq_kquant_test` checks them on each card.
++- **The prompt path's MMQ kernels for Q4_K / Q5_K / Q5_1 experts are compiled in but OFF** (`-DSTRATA_MMQ_KQUANTS=ON`,
++  added by setup for a Volta build). `prefill_mmq_kquant_test` left output rows unwritten on both cards (first GPU run,
++  2026-10-02), so prompts use FP16 dequantize + cuBLAS (measured ~10% slower, known correct) until that is fixed.
++  `STRATA_MMQ_KQUANTS=1` in the config's `env` turns them on (bench variant `mmq_kq`).
 +- **New test** `bf16_gemm_fallback_test` (cuBLAS vs fallback against FP64), and the two tools below.
 +
 +## Running it
@@ -148,8 +148,13 @@ index 0000000..60575b0
 +2. `v100\2_gpu_tests.bat` - **uses both GPUs** (~30-40 min). It runs the kernel parity tests on each card alone,
 +   then `tools/v100_bench.py`: every variant reloads the model and measures decode, 4K/16K prompt speed and a
 +   greedy coding answer. Logs: `v100_gputest.log`, `v100_bench.log`, `v100_bench.json`.
-+3. `v100\3_start_server.bat` (or setup's own `start-unsloth-UD-Q4_K_XL.bat`) - the server on
++3. `v100\3_start_server.bat` (or setup's own `run-unsloth-ud-q4_k_xl.bat`) - the server on
 +   `http://127.0.0.1:8080`.
++
++4. `v100\4_long_context.bat [context]` - rewrites the config for a long context (default 262,144, the model's full
++   trained window; setup turns on KV streaming), without compiling, then (after a pause, **both GPUs**, ~45-60 min)
++   runs `tools/v100_longbench.py`: prompt reading and writing speed at 32K / 128K / 240K tokens and a needle recall
++   test at 240K. Log: `v100_longbench.log`.
 +
 +After step 2, `START-HERE.bat --calibrate` tunes `--spec-min-p`, `--pcie-frac` and the CPU worker count on this PC
 +and saves the result in the config.
@@ -168,6 +173,44 @@ index 0000000..60575b0
 +
 +**Windows commit charge:** the ~42 GiB RAM copy, plus every GPU allocation of a WDDM card, counts against RAM +
 +page file. Keep the page file "System managed" (see DETAILS.md, troubleshooting).
++
++## First GPU run (2026-10-02)
++
++- Every kernel parity test passes on both cards, V100 included, except `prefill_mmq_kquant_test` (both cards; the MMQ
++  prompt kernels are therefore off by default, above). cuBLAS has a BF16 GEMM on the V100 (5 TFLOP/s), so the fallback
++  kernel is not needed there; it passes too.
++- The greedy coding answer was token-for-token the same in all 8 benchmark variants, including the V100 alone.
++- Bug found and fixed: on a split the RAM copy was ranked by CUDA0's share of the profile only, so it held just CUDA0's
++  layers' experts (20.3 GiB of the 42 GiB) and the V100's layers read ~7,450 experts from the files. The V100 alone
++  (no split, everything in RAM) was the fastest variant: 31 tok/s against 9-12 tok/s for the split.
++- The CPU pool on the P-cores (and their SMT siblings) without the E-cores was 3x faster than all cores in that run
++  (28.7 vs 9.3 tok/s), with file reads in the path; it is measured again after the fix.
++- **The V100 runs at PCIe 3.0 x4** (3.3 GB/s measured by the engine; the 4070 Super has 23.8 GB/s). Decode barely
++  crosses PCIe, but prompts stream the experts no GPU holds to the card that runs the layer, so long prompts are limited
++  by that link on the V100's layers. A slot wired to the CPU (x8 or x16) would help prompts directly.
++
++## Second GPU run (2026-10-02, after the RAM-copy fix)
++
++The RAM copy now holds all 41.8 GiB of the experts no GPU holds; no expert is read from the files (`file blobs 0`).
++Greedy decode, 192 tokens, median of 6 (3 prompts x 2), 32K context:
++
++| Variant | Decode tok/s | Prompt 4K / 16K tok/s |
++| --- | ---: | ---: |
++| 4070S + V100, all cores (setup's config) | 41.0 | 219 / 461 |
++| **4070S + V100, P-cores + SMT (11 workers)** | **43.3** | 220 / 451 |
++| 4070S + V100, P-cores only (5 workers) | 40.6 | 218 / 456 |
++| V100 + 4070S (V100 first) | 34.8 | 220 / 373 |
++| V100 + 4070S, P-cores + SMT | 37.4 | 227 / 370 |
++| V100 alone | 33.3 | 186 / 380 |
++| (upstream: one 12 GB GPU, 64 GB RAM) | 7-8.5 | 41 / 160 |
++
++- The default is now the 4070 Super first with `--pool-affinity auto --pool-workers 11` (`tools/v100_setup.py`
++  writes it into the config after setup). The second run of each prompt is ~50% faster than the first: the expert
++  cache adapts to the conversation.
++- Every greedy answer is correct code; the P-core variant's differs from token 19 (another expert placement, a
++  near-tie), the rest are identical.
++- Prompts are the weak spot (~460 tok/s at 16K, ~10% lower than run 1 with the MMQ kernels off): the V100's PCIe 3.0
++  x4 link and its FP32 prompt attention.
 +
 +## Not done yet (worth doing once the logs are in)
 +
@@ -266,12 +309,16 @@ index d042d11..8ff0632 100644
                                    (a.low_ram == "auto" and low_ram_needed(model, ram)))
      if low_ram and multi:
 diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
-index 32d6408..78eba72 100644
+index 32d6408..429874d 100644
 --- a/src/core/expert_source.cpp
 +++ b/src/core/expert_source.cpp
-@@ -1121,7 +1121,8 @@ bool FileExpertSource::pin_cache_complement(
+@@ -1119,9 +1119,11 @@ bool FileExpertSource::pin_cache_complement(
+     };
+     if (bytes > 0) {
          std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
-                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
+-                     (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
++                     (double) bytes / 1073741824.0,
++                     pin && !no_pagelock_ ? "page-locked" : pin ? "locked resident" : "pageable resident");
          std::fflush(stderr);
 -        if (pin) {
 +        if (pin && no_pagelock_) note = "page-locking skipped (a layer split under WDDM)";
@@ -279,7 +326,7 @@ index 32d6408..78eba72 100644
              const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
                                                           cudaHostAllocMapped | cudaHostAllocPortable);
              if (allocated == cudaSuccess) {
-@@ -1344,7 +1345,8 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
+@@ -1344,7 +1346,8 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
      }
      const size_t total = (size_t) n * (size_t) blob;
      void* p = nullptr;
@@ -454,19 +501,20 @@ index cfa966a..d156e59 100644
  
  void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
 diff --git a/src/prefill/moe_mmq.cu b/src/prefill/moe_mmq.cu
-index 3566907..650df01 100644
+index 3566907..a75c91d 100644
 --- a/src/prefill/moe_mmq.cu
 +++ b/src/prefill/moe_mmq.cu
-@@ -90,6 +90,15 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
+@@ -90,6 +90,16 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
  bool built() { return true; }
  
  bool supported(int t) {
 +#ifdef STRATA_MMQ_KQUANTS
-+    // V100 fork: STRATA_MMQ_KQUANTS=0 sends the Q4_K / Q5_K / Q5_1 experts back to the FP16 dequantize + cuBLAS
-+    // path (the A/B arm of a build that has the MMQ kernels)
++    // V100 fork: OFF unless STRATA_MMQ_KQUANTS=1.  prefill_mmq_kquant_test left output rows unwritten on both the V100
++    // and the RTX 4070 Super (2026-10-02, its second batch), so the Q4_K / Q5_K / Q5_1 experts take the FP16 dequantize
++    // + cuBLAS path (measured ~10% slower prompts, known correct) until that is understood.
 +    static const bool kq_off = [] {
 +        const char* v = std::getenv("STRATA_MMQ_KQUANTS");
-+        return v != nullptr && v[0] == '0';
++        return v == nullptr || v[0] != '1';
 +    }();
 +    if (kq_off && (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q5_1)) return false;
 +#endif
@@ -474,7 +522,7 @@ index 3566907..650df01 100644
          case GGML_TYPE_Q2_0:
  #ifdef STRATA_ORCA_Q4KS_MMQ
 diff --git a/src/program/generate.cpp b/src/program/generate.cpp
-index 1a2f203..cdf01f4 100644
+index 1a2f203..ead7e2e 100644
 --- a/src/program/generate.cpp
 +++ b/src/program/generate.cpp
 @@ -126,14 +126,22 @@ using Clock = std::chrono::steady_clock;
@@ -564,11 +612,24 @@ index 1a2f203..cdf01f4 100644
          return 2;
      }
      // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
-@@ -3757,7 +3786,25 @@ int main(int argc, char** argv) {
+@@ -2408,7 +2437,11 @@ int main(int argc, char** argv) {
+         while (st < (int) split_at.size() && l >= split_at[(size_t) st]) ++st;
+         return st;
+     };
++    // V100 fork: the whole model's ranking, kept for the RAM-budget mode on a split (below the split, `profile` is
++    // CUDA0's share only; ranking the RAM copy by that left every later stage's non-GPU expert on the files)
++    std::vector<std::pair<int32_t, int32_t>> profile_all;
+     if (multi_gpu) {
++        profile_all = profile;
+         std::vector<std::pair<int32_t, int32_t>> mine;
+         for (const auto& pr : profile) {
+             const int st = stage_of(pr.first);
+@@ -3757,8 +3790,26 @@ int main(int argc, char** argv) {
              const int64_t k = plan_lend(chunk);
              if (k > 0) lend_from = xcache.slots() - k;
          }
 -        if (src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
+-                                     o.resident_budget, &profile)) {
 +        // a layer split: the later stages' caches hold their layers' experts on their own GPUs - none of those is
 +        // copied into RAM (the budget goes to the hottest experts no GPU holds)
 +        std::vector<std::pair<int32_t, int32_t>> stage_pairs;
@@ -588,10 +649,11 @@ index 1a2f203..cdf01f4 100644
 +                                 "RAM, not page-locked by the GPU driver\n");
 +        }
 +        if (src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from, o.resident_headroom,
-                                      o.resident_budget, &profile)) {
++                                     o.resident_budget, multi_gpu ? &profile_all : &profile)) {
              if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
                  !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
-@@ -4453,7 +4500,13 @@ int main(int argc, char** argv) {
+                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
+@@ -4453,7 +4504,13 @@ int main(int argc, char** argv) {
              }
              std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
              if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
@@ -796,10 +858,10 @@ index 080b51c..8516e6f 100644
          self.assertNotIn("layer_split", cfg)
 diff --git a/tools/v100_bench.py b/tools/v100_bench.py
 new file mode 100644
-index 0000000..a1cccd6
+index 0000000..43e0977
 --- /dev/null
 +++ b/tools/v100_bench.py
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,243 @@
 +"""V100 fork: measure UD-Q4_K_XL on the RTX 4070 Super + Tesla V100 + 96 GB PC, one engine setting per run.
 +
 +Every variant restarts the engine with one change against the config setup wrote (strata-unsloth-ud-q4_k_xl.json),
@@ -867,15 +929,18 @@ index 0000000..a1cccd6
 +                {"--pool-affinity": "p-cores"}, {}, None),
 +    "own_buffers": ("every GPU keeps its own prompt buffers (no loan from the expert caches)", {},
 +                    {"STRATA_SPLIT_OWN": "1"}, None),
-+    "no_mmq_kq": ("prompt experts by FP16 dequantize + cuBLAS instead of the MMQ kernels", {},
-+                  {"STRATA_MMQ_KQUANTS": "0"}, None),
++    "mmq_kq": ("prompt experts by the MMQ kernels (opt-in: their test left rows unwritten) instead of FP16 + cuBLAS",
++               {}, {"STRATA_MMQ_KQUANTS": "1"}, None),
++    "v100_first_pcores": ("the V100 first, CPU pool on the P-cores and their SMT siblings (11 workers)",
++                          {"--pool-affinity": "auto", "--pool-workers": "11"}, {}, swap_gpus),
 +    "miss300": ("layer split placement with a higher CPU-miss cost (Q4 experts on a 6P+8E AVX2 CPU)", {},
 +                {"STRATA_SPLIT_MISS_MS": "300"}, None),
 +    "v100_first": ("the V100 as the first GPU (the 4070S then holds the head and the draft layer)", {}, {},
 +                   swap_gpus),
 +    "v100_only": ("the V100 alone (what upstream Strata would do: one GPU)", {}, {}, one_gpu(1)),
 +}
-+DEFAULT_ORDER = ["baseline", "kq256", "pcores", "own_buffers", "no_mmq_kq", "miss300", "v100_first", "v100_only"]
++# run 2 (2026-10-02): after the RAM-copy fix - the CPU pool and the card order are the open questions
++DEFAULT_ORDER = ["baseline", "pcores", "pcores6", "v100_first", "v100_first_pcores", "v100_only"]
 +
 +
 +class Log:
@@ -1189,12 +1254,217 @@ index 0000000..7a2b704
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+diff --git a/tools/v100_longbench.py b/tools/v100_longbench.py
+new file mode 100644
+index 0000000..ef487b3
+--- /dev/null
++++ b/tools/v100_longbench.py
+@@ -0,0 +1,199 @@
++"""V100 fork: long-context benchmark - starts the Strata server on the config, then measures through its API.
++
++1. Speed: one long prompt per length (the repository's own text, with a unique first line so no prompt cache can
++   help), "summarize it", 256 greedy tokens, thinking off.  Logged per length: prompt tokens, prompt reading tok/s,
++   writing tok/s at that context, wall time.
++2. Recall: needle-in-a-haystack at the longest length - a code word hidden at several depths, asked for afterwards
++   (tools/needle_bench.py's text and words).  The depths run deepest first, so later ones reuse the shared prefix.
++Everything goes to one log (default v100_longbench.log) and a JSON next to it; the engine's own log is the config's.
++
++    .venv\\Scripts\\python tools\\v100_longbench.py                                 (what v100\\4_long_context.bat runs)
++    ... --lengths 32k,128k,240k --needle-length 240k --depths 90,50,10
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import random
++import subprocess
++import sys
++import time
++import urllib.error
++import urllib.request
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / "tools"))
++import needle_bench as NB  # noqa: E402  (haystack, WORDS, CHARS_PER_TOKEN)
++
++
++class Log:
++    def __init__(self, path: Path):
++        self.f = open(path, "a", encoding="utf-8")
++
++    def __call__(self, *parts):
++        line = " ".join(str(p) for p in parts)
++        print(line, flush=True)
++        self.f.write(line + "\n")
++        self.f.flush()
++
++
++def tokens_of(s: str) -> int:
++    s = s.lower()
++    return int(float(s.rstrip("k")) * 1000) if s.endswith("k") else int(s)
++
++
++def get(url, timeout=10):
++    with urllib.request.urlopen(url, timeout=timeout) as r:
++        return json.loads(r.read())
++
++
++def chat(url, prompt, max_tokens, timeout):
++    body = {"model": "strata", "max_tokens": max_tokens, "temperature": 0,
++            "chat_template_kwargs": {"enable_thinking": False},
++            "messages": [{"role": "user", "content": prompt}]}
++    req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(),
++                                 headers={"Content-Type": "application/json"})
++    t0 = time.time()
++    with urllib.request.urlopen(req, timeout=timeout) as r:
++        out = json.loads(r.read())
++    return out, time.time() - t0
++
++
++def smi(log):
++    try:
++        r = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total,pcie.link.gen.current,"
++                            "pcie.link.width.current", "--format=csv"], capture_output=True, text=True, timeout=30)
++        for line in r.stdout.strip().splitlines():
++            log("    " + line)
++    except Exception as e:  # noqa: BLE001
++        log("    nvidia-smi failed:", e)
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--config", default=str(ROOT / "strata-unsloth-ud-q4_k_xl.json"))
++    ap.add_argument("--port", type=int, default=8091)
++    ap.add_argument("--log", default=str(ROOT / "v100_longbench.log"))
++    ap.add_argument("--lengths", default="32k,128k,240k", help="speed runs (k = 1000 tokens)")
++    ap.add_argument("--needle-length", default="240k")
++    ap.add_argument("--depths", default="90,50,10")
++    ap.add_argument("--timeout", type=float, default=3600)
++    a = ap.parse_args()
++    log = Log(Path(a.log))
++    url = f"http://127.0.0.1:{a.port}"
++    cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig"))
++    ctx = int(cfg["args"][cfg["args"].index("--max-context") + 1]) if "--max-context" in cfg["args"] else 0
++    log(f"==== v100_longbench {time.strftime('%Y-%m-%d %H:%M:%S')}  config {a.config}  context {ctx}")
++    log("    args:", " ".join(cfg["args"]))
++    log("    env:", json.dumps(cfg.get("env", {})), " gpu:", cfg.get("gpu"))
++    smi(log)
++    server_log = open(Path(a.log).with_suffix(".server.txt"), "a", encoding="utf-8")
++    proc = subprocess.Popen([sys.executable, "-m", "serve.server", "--engine", "strata", "--config", a.config,
++                             "--port", str(a.port)], cwd=str(ROOT), stdout=server_log, stderr=subprocess.STDOUT,
++                            stdin=subprocess.DEVNULL)
++    results = {"speed": [], "needles": []}
++    try:
++        t0 = time.time()
++        while True:
++            if proc.poll() is not None:
++                log(f"    the server exited (code {proc.returncode}) - see {server_log.name} and the engine log")
++                return 1
++            try:
++                h = get(url + "/health")
++                if h.get("loaded") and h.get("max_context"):
++                    break
++            except (OSError, ValueError):
++                pass
++            if time.time() - t0 > 900:
++                log("    the server did not get ready in 15 minutes")
++                return 1
++            time.sleep(5)
++        log(f"    server ready in {time.time() - t0:.0f} s, max_context {h.get('max_context')}")
++        try:
++            m = get(url + "/metrics")
++            log("    engine:", json.dumps(m.get("engine", {}))[:1500])
++        except (OSError, ValueError):
++            pass
++        smi(log)
++        max_ctx = int(h["max_context"])
++        # 1. speed
++        for i, L in enumerate(x.strip() for x in a.lengths.split(",") if x.strip()):
++            n = tokens_of(L)
++            if n + 600 > max_ctx:
++                log(f"\n--- {L}: skipped (context {max_ctx})")
++                continue
++            text = NB.haystack(int(n * NB.CHARS_PER_TOKEN))
++            prompt = (f"Document set {random.randrange(10**9)} ({L}).\n" + text +
++                      "\n\nSummarize the text above in five bullet points, one line each.")
++            log(f"\n--- speed {L}: sending ~{n:,} tokens ...")
++            try:
++                out, secs = chat(url, prompt, 256, a.timeout)
++            except (OSError, urllib.error.HTTPError) as e:
++                log(f"    request failed: {e}")
++                results["speed"].append({"length": L, "error": str(e)})
++                continue
++            t = out.get("timings") or {}
++            u = out.get("usage") or {}
++            row = {"length": L, "prompt_tokens": u.get("prompt_tokens"), "cache_n": t.get("cache_n"),
++                   "prompt_tok_s": t.get("prompt_per_second"), "prompt_s": round((t.get("prompt_ms") or 0) / 1000, 1),
++                   "decode_tok_s": t.get("predicted_per_second"), "generated": t.get("predicted_n"),
++                   "wall_s": round(secs, 1)}
++            results["speed"].append(row)
++            log(f"    prompt {row['prompt_tokens']} tokens (cached {row['cache_n']}): {row['prompt_tok_s']} tok/s, "
++                f"{row['prompt_s']} s;  writing {row['decode_tok_s']} tok/s ({row['generated']} tokens);  "
++                f"wall {row['wall_s']} s")
++            answer = ((out.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
++            log("    answer: " + answer.strip().replace("\n", " / ")[:600])
++        # 2. needles
++        n = tokens_of(a.needle_length)
++        if n + 300 > max_ctx:
++            log(f"\n--- needles {a.needle_length}: skipped (context {max_ctx})")
++        else:
++            text = NB.haystack(int(n * NB.CHARS_PER_TOKEN))
++            rnd = random.Random(11)
++            for d in (int(x) for x in a.depths.split(",")):
++                word = f"{rnd.choice(NB.WORDS)}-{rnd.choice(NB.WORDS)}-{rnd.randint(100, 999)}"
++                cut = int(len(text) * d / 100)
++                cut = text.rfind("\n", 0, cut) + 1 or cut
++                needle = f"\nThe secret code word for this text is: {word}. Remember it.\n"
++                prompt = (text[:cut] + needle + text[cut:] +
++                          "\n\nWhat is the secret code word mentioned in the text above? Reply with the code word only.")
++                log(f"\n--- needle {a.needle_length} at depth {d}% ...")
++                try:
++                    out, secs = chat(url, prompt, 40, a.timeout)
++                except (OSError, urllib.error.HTTPError) as e:
++                    log(f"    request failed: {e}")
++                    results["needles"].append({"depth": d, "error": str(e)})
++                    continue
++                answer = ((out.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
++                t = out.get("timings") or {}
++                ok = word in answer
++                results["needles"].append({"depth": d, "found": ok, "word": word, "answer": answer.strip()[:200],
++                                           "prompt_tokens": (out.get("usage") or {}).get("prompt_tokens"),
++                                           "cache_n": t.get("cache_n"), "prompt_tok_s": t.get("prompt_per_second"),
++                                           "wall_s": round(secs, 1)})
++                log(f"    {'FOUND' if ok else 'MISSED'} ({word}); answer {answer.strip()[:80]!r}; "
++                    f"{(out.get('usage') or {}).get('prompt_tokens')} tokens, cached {t.get('cache_n')}, "
++                    f"{t.get('prompt_per_second')} tok/s, wall {secs:.0f} s")
++        smi(log)
++    finally:
++        try:
++            proc.terminate()
++            proc.wait(60)
++        except Exception:  # noqa: BLE001
++            proc.kill()
++    log("\n==== summary")
++    for r in results["speed"]:
++        log(f"    {r['length']:>6}: prompt {r.get('prompt_tok_s')} tok/s ({r.get('prompt_s')} s), "
++            f"writing {r.get('decode_tok_s')} tok/s" + (f"  ERROR {r['error']}" if r.get("error") else ""))
++    for r in results["needles"]:
++        log(f"    needle {a.needle_length} depth {r['depth']}%: "
++            + ("FOUND" if r.get("found") else "MISSED" if "found" in r else "ERROR " + r.get("error", "")))
++    Path(a.log).with_suffix(".json").write_text(json.dumps(results, indent=1), encoding="utf-8")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/tools/v100_setup.py b/tools/v100_setup.py
 new file mode 100644
-index 0000000..1fbec62
+index 0000000..924ac19
 --- /dev/null
 +++ b/tools/v100_setup.py
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,156 @@
 +"""V100 fork: set up UD-Q4_K_XL on an RTX 4070 Super + Tesla V100 PC, and build the GPU test programs.
 +
 +Uses NO GPU: it only asks nvidia-smi which cards are there, then runs setup (download/pack if needed, compile the
@@ -1285,8 +1555,20 @@ index 0000000..1fbec62
 +        cmd = [py, str(ROOT / "setup.py"), "--setup", "--build", "--yes", "--no-start", "--family", "unsloth",
 +               "--model", "UD-Q4_K_XL", "--gpus", order, "--context", str(a.context), "--vision", "no",
 +               "--experimental-speed-projection", "off"]
-+        if a.gguf_dir:
-+            cmd += ["--gguf-dir", a.gguf_dir]
++        gguf_dir = a.gguf_dir
++        old_cfg = ROOT / "strata-unsloth-ud-q4_k_xl.json"
++        if not gguf_dir and old_cfg.exists():
++            # a run again (another --context): the model files stay where the last setup found them - without this,
++            # setup looks in Strata-data\models and would download the 111 GB again
++            import json
++            args = json.loads(old_cfg.read_text(encoding="utf-8-sig")).get("args", [])
++            if "--native" in args:
++                native = Path(args[args.index("--native") + 1])
++                if native.exists():
++                    gguf_dir = str(native.parent)
++                    log(f"  model files: {gguf_dir} (from the existing config)")
++        if gguf_dir:
++            cmd += ["--gguf-dir", gguf_dir]
 +        if a.data_dir:
 +            cmd += ["--data-dir", a.data_dir]
 +        rc = run_logged(cmd, log, cwd=str(ROOT))
@@ -1320,6 +1602,18 @@ index 0000000..1fbec62
 +        log(f"    {'ok     ' if p.exists() else 'MISSING'} {p}")
 +    cfg = ROOT / "strata-unsloth-ud-q4_k_xl.json"
 +    log(f"  config: {cfg} {'(present)' if cfg.exists() else '(MISSING)'}")
++    if cfg.exists():
++        # measured on this PC (2026-10-02, v100_bench run 2): the CPU expert pool on the P-cores and their SMT
++        # siblings, without the E-cores - 43.3 vs 41.0 tok/s, ahead in 4 of 6 prompts
++        import json
++        c = json.loads(cfg.read_text(encoding="utf-8-sig"))
++        for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11")):
++            if flag in c["args"]:
++                c["args"][c["args"].index(flag) + 1] = val
++            else:
++                c["args"] += [flag, val]
++        cfg.write_text(json.dumps(c, indent=1), encoding="utf-8")
++        log("  tuned for this PC: --pool-affinity auto --pool-workers 11")
 +    if cfg.exists():
 +        log(cfg.read_text(encoding="utf-8"))
 +    return rc
@@ -1373,14 +1667,46 @@ index 0000000..36dc490
 +pause
 diff --git a/v100/3_start_server.bat b/v100/3_start_server.bat
 new file mode 100644
-index 0000000..1de1a62
+index 0000000..af1dd4d
 --- /dev/null
 +++ b/v100/3_start_server.bat
 @@ -0,0 +1,7 @@
 +@echo off
 +rem V100 fork, step 3 - starts the Strata server on both GPUs with the config step 1 wrote (http://127.0.0.1:8080).
-+rem (The same as the start script setup wrote, start-unsloth-UD-Q4_K_XL.bat.)  Extra options go to the server.
++rem (The same as the start script setup wrote, run-unsloth-ud-q4_k_xl.bat.)  Extra options go to the server.
 +setlocal
 +cd /d "%~dp0.."
 +".venv\Scripts\python.exe" -m serve.server --engine strata --config strata-unsloth-ud-q4_k_xl.json %*
++pause
+diff --git a/v100/4_long_context.bat b/v100/4_long_context.bat
+new file mode 100644
+index 0000000..888c99e
+--- /dev/null
++++ b/v100/4_long_context.bat
+@@ -0,0 +1,26 @@
++@echo off
++rem V100 fork, step 4 - long context.
++rem   Part 1 (no GPU): rewrites the config for a 256K context (262,144 tokens, the model's full trained window; setup
++rem   turns on KV streaming for it) - the engine is not compiled again.  Log: v100_setup.log.
++rem   Part 2 (USES BOTH GPUs, ~45-60 minutes): starts the server on port 8091 and measures prompt reading and writing
++rem   speed at 32K / 128K / 240K tokens, then a needle-in-a-haystack recall test at 240K (3 depths).
++rem   Logs: v100_longbench.log (+ .json, + .server.txt) and the engine log strata-unsloth-ud-q4_k_xl.log.
++rem   Another context: 4_long_context.bat 196608   (the first option is the context in tokens)
++setlocal
++cd /d "%~dp0.."
++set CTX=%1
++if "%CTX%"=="" set CTX=262144
++".venv\Scripts\python.exe" tools\v100_setup.py --context %CTX%
++if errorlevel 1 (
++  echo Setup failed - send v100_setup.log back for review.
++  pause
++  exit /b 1
++)
++echo.
++echo The config is now set up for %CTX% tokens of context.
++echo Part 2 uses both GPUs for about 45-60 minutes. Stop any other GPU program first.
++pause
++".venv\Scripts\python.exe" tools\v100_longbench.py
++echo.
++echo Done. Send v100_longbench.log and strata-unsloth-ud-q4_k_xl.log back for review.
 +pause
