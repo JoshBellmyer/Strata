@@ -1379,6 +1379,28 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
     return true;
 }
 
+bool FileExpertSource::exchange_copy() {
+    for (Exchange& x : staged_) {
+        const uint8_t* src = override_.empty() ? nullptr : override_[x.out];
+        const uint64_t at = complement_offsets_[x.in];
+        x.copied = src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
+                   complement_host_ != nullptr;
+        if (x.copied) std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
+    }
+    return true;
+}
+
+int64_t FileExpertSource::exchange_flip() {
+    int64_t n = 0;
+    for (const Exchange& x : staged_) {
+        if (x.copied && detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
+        override_[x.out] = nullptr;
+    }
+    staged_.clear();
+    exchanges_ += n;
+    return n;
+}
+
 int64_t FileExpertSource::commit_exchanges() {
     int64_t n = 0;
     for (const Exchange& x : staged_) {

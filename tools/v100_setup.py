@@ -142,13 +142,16 @@ def main() -> int:
         c = json.loads(cfg.read_text(encoding="utf-8-sig"))
         # v100_prefillbench (2026-10-03): the V100 reads long prompts in 32768-token chunks - 814 vs 543 tok/s on a
         # 114K prompt (16384: 758)
-        for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11"), ("--prefill", "auto:32768")):
+        # v100_decodebench2 (2026-10-03): at most 32 adaptive swaps per round - 55.6 / 46.3 tok/s (short / after 60K)
+        # against 52.4 / 40.9 with 96 (the swaps share the V100's x4 link with decoding)
+        for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11"), ("--prefill", "auto:32768"),
+                          ("--adapt-swaps", "32")):
             if flag in c["args"]:
                 c["args"][c["args"].index(flag) + 1] = val
             else:
                 c["args"] += [flag, val]
         cfg.write_text(json.dumps(c, indent=1), encoding="utf-8")
-        log("  tuned for this PC: --pool-affinity auto --pool-workers 11 --prefill auto:32768")
+        log("  tuned for this PC: --pool-affinity auto --pool-workers 11 --prefill auto:32768 --adapt-swaps 32")
     if cfg.exists():
         log(cfg.read_text(encoding="utf-8"))
     return rc

@@ -457,6 +457,12 @@ public:
     bool stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q);
     /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
     int64_t commit_exchanges();
+    /// V100 fork: `commit_exchanges` in two halves, so the copy (one blob per swap, ~3 MB each) can run on a worker
+    /// thread while windows run: `exchange_copy` writes each staged `out` into `in`'s place (nothing reads `in` from
+    /// here once its slot is resident on the device, and `out` is still read from its exchange buffer), then
+    /// `exchange_flip` - between windows - points the copy's index at the moved blobs and drops the overrides.
+    bool exchange_copy();
+    int64_t exchange_flip();
     int64_t exchanges() const { return exchanges_; }
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
     /// the SSD).  0 in a steady resident mode; lend-region experts that did not fit the RAM count here.
@@ -560,7 +566,7 @@ private:
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
-    struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
+    struct Exchange { size_t in, out; int64_t q; uint64_t bytes; bool copied = false; };
     std::vector<Exchange> staged_;
     uint8_t* xstage_ = nullptr;               ///< exchange buffers, `xstage_cap_ x xstage_blob_`
     bool xstage_pinned_ = false;

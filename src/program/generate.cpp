@@ -93,6 +93,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <sstream>
 #include <string>
 #include <set>
@@ -4556,9 +4557,106 @@ int main(int argc, char** argv) {
             pending.clear();
             res_upload();
         };
+        // ---- V100 fork: THE ADAPTIVE TIER WITHOUT STALLS.  The swap below (0.1.32's) ran in a thread beside the
+        // commit and the draft, and the decode loop joined it: it waited for every evicted expert's copy back to RAM
+        // (cudaStreamSynchronize), then copied each incoming expert from RAM into its slot - from pageable memory on
+        // a WDDM split, so each copy blocks - and the next round's apply_pending then moved every evicted blob into
+        // its RAM place with a memcpy.  Up to 96 x ~3 MB, ~2/3 of them over the V100's PCIe 3.0 x4 link (3.3 GB/s):
+        // ~140 ms every 4th window, measured as 10-25 ms per window of decode time that no stage accounted for
+        // (v100_decodebench, 2026-10-03; 23-32 ms with the V100 alone).
+        // Now the heavy parts run on a worker thread while windows keep running, and every change of what is
+        // resident (host_res and the device tables, the RAM copy's index) happens on this thread between windows,
+        // one step per round: 1 worker: evicted experts -> exchange buffers; main: they become CPU experts (read
+        // from those buffers), tables uploaded; 3 worker: incoming experts -> the freed slots; main: they become
+        // resident, tables uploaded; 5 worker: evicted blobs -> the incoming experts' RAM places; main: the RAM
+        // copy's index flips.  Same swaps, same bytes: the answers do not change.  STRATA_ADAPT_SYNC=1: 0.1.32's.
+        static const bool adapt_sync = [] {
+            const char* v = std::getenv("STRATA_ADAPT_SYNC");
+            return v != nullptr && v[0] == '1';
+        }();
+        struct AdaptSwap { int32_t layer, in, out, slot; int64_t q; };
+        auto swap_owner = [&](int32_t layer) -> SwapOwner {
+            const int stn = multi_gpu ? stage_of(layer) : 0;
+            GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
+            return gs ? SwapOwner{&gs->cache, gs->dev, gs->adapt_stream} : SwapOwner{&xcache, -1, adapt_stream};
+        };
+        // copies on the owners' adapt streams, then waits for those streams (the worker's part)
+        auto adapt_copies = [&](const std::vector<AdaptSwap>& job_swaps, bool to_device) -> bool {
+            std::vector<SwapOwner> used;
+            for (const AdaptSwap& w : job_swaps) {
+                if (!to_device && w.q < 0) continue;
+                const SwapOwner o_ = swap_owner(w.layer);
+                const strata::core::OnDevice on(o_.dev);
+                const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer);
+                uint8_t* slot_ptr = (uint8_t*) o_.cache->device_slot(w.slot);
+                cudaError_t e;
+                if (to_device) {
+                    const uint8_t* b = srcp->blob(w.layer, w.in);
+                    if (b == nullptr) return false;
+                    e = cudaMemcpyAsync(slot_ptr, b, bytes, cudaMemcpyHostToDevice, o_.stream);
+                } else {
+                    e = cudaMemcpyAsync(src.exchange_buffer(w.q), slot_ptr, bytes, cudaMemcpyDeviceToHost, o_.stream);
+                }
+                if (e != cudaSuccess) return false;
+                bool seen = false;
+                for (const SwapOwner& u : used) seen = seen || (u.dev == o_.dev && u.stream == o_.stream);
+                if (!seen) used.push_back(o_);
+            }
+            for (const SwapOwner& u : used) {
+                const strata::core::OnDevice on(u.dev);
+                if (cudaStreamSynchronize(u.stream) != cudaSuccess) return false;
+            }
+            return true;
+        };
+        // the tables, uploaded and landed before the worker's next copy (res_upload's copies come from pageable
+        // memory: cudaMemcpy may return before its DMA has written the device table)
+        auto res_upload_landed = [&]() {
+            res_upload();
+            if (d_res != nullptr) cudaStreamSynchronize(0);
+            for (auto& st : stages) {
+                const strata::core::OnDevice on(st->dev);
+                cudaStreamSynchronize(0);
+            }
+        };
+        // declared after everything its worker uses: an early return waits for the worker (~future) first
+        struct AdaptJob {
+            int state = 0;                 // 0 idle, 1 fetching, 3 uploading, 5 copying (the worker's step)
+            std::vector<AdaptSwap> swaps;
+            std::future<bool> work;
+        } ajob;
+        // one step of the job (`wait`: to the end); false only when a copy failed
+        auto adapt_step = [&](bool wait) -> bool {
+            while (ajob.state != 0) {
+                if (!wait && ajob.work.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return true;
+                if (!ajob.work.get()) { ajob.state = 0; ajob.swaps.clear(); return false; }
+                if (ajob.state == 1) {          // the evicted experts are in RAM: the CPU computes them from now on
+                    std::vector<AdaptSwap> kept;
+                    for (AdaptSwap& w : ajob.swaps) {
+                        if (w.q >= 0 && !src.stage_exchange(w.layer, w.in, w.out, w.q)) continue;
+                        host_res[(size_t) w.layer * g.n_expert + w.out] = strata::core::kNotResident;
+                        kept.push_back(w);
+                    }
+                    ajob.swaps.swap(kept);
+                    res_upload_landed();
+                    ajob.state = 3;
+                    ajob.work = std::async(std::launch::async, [&] { return adapt_copies(ajob.swaps, true); });
+                } else if (ajob.state == 3) {   // the incoming experts have landed in their slots
+                    for (const AdaptSwap& w : ajob.swaps) host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
+                    res_upload_landed();
+                    ajob.state = 5;
+                    ajob.work = std::async(std::launch::async, [&] { return src.complement_ready() ? src.exchange_copy() : true; });
+                } else {                        // the evicted blobs are in their RAM places
+                    if (src.complement_ready()) src.exchange_flip();
+                    ajob.state = 0;
+                    ajob.swaps.clear();
+                }
+                if (!wait) return true;         // one step per round
+            }
+            return true;
+        };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
-            if (!pending.empty()) return true;   // the previous swaps are still in flight
+            if (!pending.empty() || ajob.state != 0) return true;   // the previous swaps are still in flight
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
@@ -4583,6 +4681,25 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            if (!adapt_sync) {   // V100 fork: the job above (the worker copies; this only picks and starts it)
+                ajob.swaps.clear();
+                int64_t q = 0;
+                for (const Swap& s : swaps) {
+                    const int32_t slot = host_res[(size_t) s.layer * g.n_expert + s.out];
+                    if (slot < 0 || swap_owner(s.layer).cache == nullptr) continue;
+                    int64_t qs = -1;   // an exchange (the RAM copy takes the evicted expert) when it can
+                    if (src.complement_ready() && src.has_resident(s.layer, s.in) && !src.has_resident(s.layer, s.out)) {
+                        if (q >= src.exchange_capacity()) continue;
+                        qs = q++;
+                    }
+                    ajob.swaps.push_back({s.layer, s.in, s.out, slot, qs});
+                }
+                for (float& v : drive.d.usage) v *= 0.7f;
+                if (ajob.swaps.empty()) return true;
+                ajob.state = 1;
+                ajob.work = std::async(std::launch::async, [&] { return adapt_copies(ajob.swaps, false); });
+                return true;
+            }
             // a layer split: each evicted expert is copied back from the cache (and device) that owns its layer
             if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, [&](int32_t layer) {
                     const int stn = multi_gpu ? stage_of(layer) : 0;
@@ -5296,6 +5413,10 @@ int main(int argc, char** argv) {
                 }
                 return true;
             };
+            if (!adapt_step(true)) {   // V100 fork: a job left by the last request finishes before anything lends
+                std::printf("ERR an adaptive swap failed\n");
+                return 1;
+            }
             apply_pending(true);
             // per-request sampling for the verify window's head (greedy when temperature is absent)
             strata::kernels::SamplerParams req_sp;
@@ -5459,6 +5580,10 @@ int main(int argc, char** argv) {
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
+                if (!adapt_step(false)) {
+                    std::printf("ERR an adaptive swap failed\n");
+                    return 1;
+                }
                 apply_pending(false);
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
@@ -5698,6 +5823,11 @@ int main(int argc, char** argv) {
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look);
             }
+            // V100 fork: the PLE rows' reads (layer 1's n-gram table on the SSD; cumulative since the start) - each
+            // window reads its tokens' rows before it launches, so their latency is decode time
+            if (ss.ple.table != nullptr)
+                if (const std::string io = ss.ple.table->io_report(); !io.empty())
+                    std::fprintf(stderr, "strata serve: %s\n", io.c_str());
             // V100 fork: each prompt path's share of this request - its chunk, the experts it streamed to its card
             // (and how many of them by DMA straight from page-locked RAM), the host time staging the others, and the
             // time spent reading experts from the model files (lent slots' experts, mostly)
