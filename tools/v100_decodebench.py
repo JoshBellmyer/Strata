@@ -9,7 +9,7 @@ Every variant runs with STRATA_DECODE_TIMING and STRATA_SPLIT_TIMING (host clock
 engine logs ms per verify window split into waiting for the GPUs, the CPU experts, the draft, and per layer-window how
 many experts the CPU computed, VRAM hits and PCIe sends.  Those lines are copied from the engine log into this log.
 
-    .venv\\Scripts\\python tools\\v100_decodebench.py                    (what v100\\10_decode_split.bat runs)
+    .venv\\Scripts\\python tools\\v100_decodebench.py                    (what v100\\11_decode_ple.bat runs)
     ... --variants baseline,v100_only --long-tokens 100000
 """
 from __future__ import annotations
@@ -85,7 +85,68 @@ VARIANTS.update({
     "pagelock_p20": ("the RAM copy page-locked, and only 20% of CUDA0's misses over PCIe (--pcie-frac 0.2)",
                      {"--pcie-frac": "0.2"}, {"STRATA_ARENA_PIN_GIB": "0"}, None),
 })
-DEFAULT_ORDER = ["baseline", "k20", "k20_minp07", "k22", "k24", "minp07", "pagelock_p20", "baseline_end"]
+# round 5 (2026-10-03): the PLE row reads (4-6 ms per window inside the engine; the drive answers a 48-read burst in
+# under 2 ms outside it).  The config is now K=20 + --spec-min-p 0.7.
+VARIANTS.update({
+    "io48": ("48 threads issue the PLE reads (STRATA_IO_THREADS=48; default 4)", {}, {"STRATA_IO_THREADS": "48"}, None),
+    "io16": ("16 threads issue the PLE reads (STRATA_IO_THREADS=16)", {}, {"STRATA_IO_THREADS": "16"}, None),
+    "plesync": ("the PLE reads submitted on the decode thread, no I/O worker (--ple-sync-submit)", {}, {},
+                lambda cfg: cfg["args"].append("--ple-sync-submit")),
+    "keepalive5": ("the SSD kept awake with a read after 5 ms without one (STRATA_SSD_KEEPALIVE=5; default 100)", {},
+                   {"STRATA_SSD_KEEPALIVE": "5"}, None),
+})
+# Applied to the running engine once it has loaded (Windows): whether Windows slows the engine's sleeping threads
+# (the PLE reader wakes ~5 threads per decode window).  The disk test read the same file 3-10x faster from a console
+# window than the engine does.
+def _proc(pid, access):
+    import ctypes
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenProcess.restype = ctypes.c_void_p
+    h = k.OpenProcess(access, False, pid)
+    if not h:
+        raise OSError(ctypes.get_last_error(), "OpenProcess")
+    return k, h
+
+
+def no_throttle(pid):
+    """Power throttling (EcoQoS) off for the engine: SetProcessInformation(ProcessPowerThrottling), the execution
+    speed and timer-resolution controls set, their states cleared."""
+    import ctypes
+
+    class PPTS(ctypes.Structure):
+        _fields_ = [("Version", ctypes.c_ulong), ("ControlMask", ctypes.c_ulong), ("StateMask", ctypes.c_ulong)]
+    k, h = _proc(pid, 0x0200)   # PROCESS_SET_INFORMATION
+    st = PPTS(1, 0x1 | 0x4, 0)
+    k.SetProcessInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
+    ok = k.SetProcessInformation(h, 4, ctypes.byref(st), ctypes.sizeof(st))
+    err = ctypes.get_last_error()
+    k.CloseHandle(ctypes.c_void_p(h))
+    return f"power throttling off for pid {pid}: {'ok' if ok else f'FAILED ({err})'}"
+
+
+def high_priority(pid):
+    import ctypes
+    k, h = _proc(pid, 0x0200)
+    k.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    ok = k.SetPriorityClass(h, 0x80)   # HIGH_PRIORITY_CLASS
+    err = ctypes.get_last_error()
+    k.CloseHandle(ctypes.c_void_p(h))
+    return f"high priority class for pid {pid}: {'ok' if ok else f'FAILED ({err})'}"
+
+
+POST_START = {"nothrottle": no_throttle, "highprio": high_priority}
+VARIANTS.update({
+    "nothrottle": ("Windows power throttling (EcoQoS) turned off for the engine process", {}, {}, None),
+    "highprio": ("the engine process at high priority", {}, {}, None),
+})
+DEFAULT_ORDER = ["baseline", "io48", "io16", "plesync", "keepalive5", "baseline_end"]   # step 11; step 12 names its own
+# round 7 (2026-10-03): the PLE table from its own file (config --ple-gguf, tools/v100_ple_split.py) against the
+# table read from Unsloth's shard 2, which the engine also maps
+VARIANTS.update({
+    "ple_shard": ("the PLE table read from the model's shard 2 again (no --ple-gguf: the mapped file)",
+                  {"--ple-gguf": None}, {}, None),
+    "ple_shard_end": ("the PLE table from shard 2 again, last", {"--ple-gguf": None}, {}, None),
+})
 ENGINE_LINE_KEYS = ("ple io", "page-locked", "locked resident", "decode timing", "decode GPU stages", "strata serve: stage ", "hit rate", "layer split auto",
                     "expert cache ", "layer split: CUDA", "strata serve: prompt ", "pcie_frac", "PCIe probe",
                     "resident RAM mode", "ERROR", "error", "failed")
@@ -135,6 +196,11 @@ def run_variant(name, base_cfg, tok, log, long_tokens):
         copy_engine_lines(elog, elog_at, log)
         return res
     res["load_s"] = round(time.time() - t0, 1)
+    if name in POST_START:
+        try:
+            log("    " + POST_START[name](eng.proc.pid))
+        except Exception as e:  # noqa: BLE001
+            log("    (could not apply:", repr(e), ")")
     log(f"    loaded in {res['load_s']} s; INFO", json.dumps(eng.info))
     nvsmi(log)
 

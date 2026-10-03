@@ -51,6 +51,9 @@ if WIN:
     k32.GetFileAttributesW.restype = wintypes.DWORD
     k32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
     GENERIC_READ, SHARE_RW, OPEN_EXISTING = 0x80000000, 0x3, 3
     NO_BUFFERING, RANDOM_ACCESS = 0x20000000, 0x10000000
 
@@ -129,10 +132,133 @@ def test_file(path: Path, log, n_qd1=1500, batches=40, batch=48):
             walls.append((time.perf_counter() - t0) * 1e3)
         log(f"    {batch} reads at once ({batches} batches): until the last lands p50 {pct(walls, .5):.2f} ms, "
             f"p90 {pct(walls, .9):.2f} ms, max {max(walls):.2f} ms")
+        # the engine's pattern while decoding: a burst every ~40 ms, the drive idle in between.  An NVMe drive that
+        # drops into a power-saving state in the gaps pays its wake-up latency on the first read of every burst.
+        for gap in (0.010, 0.040, 0.150):
+            walls = []
+            for _ in range(40):
+                time.sleep(gap)
+                offs = [rnd.randrange(blocks) * BLOCK for _ in range(batch)]
+                t0 = time.perf_counter()
+                list(pool.map(lambda i: readers[i].read(offs[i]), range(batch)))
+                walls.append((time.perf_counter() - t0) * 1e3)
+            log(f"    {batch} at once after {gap * 1000:.0f} ms idle: p50 {pct(walls, .5):.2f} ms, p90 "
+                f"{pct(walls, .9):.2f} ms, max {max(walls):.2f} ms")
     finally:
         pool.shutdown()
         for x in readers:
             x.close()
+    # one read after an idle gap: the drive's wake-up latency alone
+    r = Reader(path)
+    try:
+        for gap in (0.005, 0.020, 0.040, 0.100, 0.300):
+            lat = []
+            for _ in range(40):
+                time.sleep(gap)
+                off = rnd.randrange(blocks) * BLOCK
+                t0 = time.perf_counter()
+                r.read(off)
+                lat.append((time.perf_counter() - t0) * 1e3)
+            log(f"    one read after {gap * 1000:.0f} ms idle: p50 {pct(lat, .5):.3f} ms, p90 {pct(lat, .9):.3f} ms, "
+                f"max {max(lat):.3f} ms")
+    finally:
+        r.close()
+
+
+def overlapped_test(path: Path, log, bursts=60, batch=48, gap=0.040):
+    """The engine's way of reading (src/platform/direct_file.cpp): ONE handle opened OVERLAPPED + NO_BUFFERING,
+    every read a ReadFile with an OVERLAPPED, completions through an I/O completion port.  If a ReadFile returns
+    only when its data is there (synchronously) instead of at once with ERROR_IO_PENDING, the engine's four issuing
+    threads read four pages at a time, not 48 - a whole decode window's rows would then take ~12 drive round trips."""
+    import ctypes
+    from ctypes import wintypes
+
+    class OVERLAPPED(ctypes.Structure):
+        _fields_ = [("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t), ("Offset", wintypes.DWORD),
+                    ("OffsetHigh", wintypes.DWORD), ("hEvent", wintypes.HANDLE)]
+
+    class ENTRY(ctypes.Structure):
+        _fields_ = [("key", ctypes.c_size_t), ("ov", ctypes.c_void_p), ("internal", ctypes.c_size_t),
+                    ("bytes", wintypes.DWORD)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)   # its own prototypes (ReadFile with an OVERLAPPED)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                wintypes.DWORD, wintypes.HANDLE]
+    k32.VirtualAlloc.restype = ctypes.c_void_p
+    k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CreateIoCompletionPort.restype = wintypes.HANDLE
+    k32.CreateIoCompletionPort.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.c_size_t, wintypes.DWORD]
+    k32.GetQueuedCompletionStatusEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.ULONG,
+                                                ctypes.POINTER(wintypes.ULONG), wintypes.DWORD, wintypes.BOOL]
+    k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+    OVERLAPPED_FLAG = 0x40000000
+    h = k32.CreateFileW(str(path), GENERIC_READ, 0x1, None, OPEN_EXISTING, NO_BUFFERING | OVERLAPPED_FLAG | RANDOM_ACCESS,
+                        None)
+    if h in (None, wintypes.HANDLE(-1).value):
+        log("    overlapped open failed:", ctypes.get_last_error())
+        return
+    port = k32.CreateIoCompletionPort(h, None, 0, 1)
+    bufs = k32.VirtualAlloc(None, batch * BLOCK, 0x3000, 0x04)
+    ovs = (OVERLAPPED * batch)()
+    entries = (ENTRY * 64)()
+    got = wintypes.ULONG(0)
+    blocks = path.stat().st_size // BLOCK - 1
+    rnd = random.Random(7)
+    sync_n = 0
+    call_ms, burst_ms = [], []
+    log(f"\n--- the engine's way: one overlapped handle + a completion port, {batch} ReadFile calls per burst, "
+        f"{gap * 1000:.0f} ms apart")
+    try:
+        for _ in range(bursts):
+            time.sleep(gap)
+            t0 = time.perf_counter()
+            for i in range(batch):
+                off = rnd.randrange(blocks) * BLOCK
+                ctypes.memset(ctypes.byref(ovs[i]), 0, ctypes.sizeof(OVERLAPPED))
+                ovs[i].Offset = off & 0xFFFFFFFF
+                ovs[i].OffsetHigh = off >> 32
+                c0 = time.perf_counter()
+                ok = k32.ReadFile(h, bufs + i * BLOCK, BLOCK, None, ctypes.byref(ovs[i]))
+                call_ms.append((time.perf_counter() - c0) * 1e3)
+                if ok:
+                    sync_n += 1
+                elif ctypes.get_last_error() != 997:   # ERROR_IO_PENDING
+                    log("    ReadFile failed:", ctypes.get_last_error())
+                    return
+            done = 0
+            while done < batch:   # every read queues one packet, synchronous or not
+                if not k32.GetQueuedCompletionStatusEx(port, entries, 64, ctypes.byref(got), 5000, False):
+                    log("    completion wait failed:", ctypes.get_last_error())
+                    return
+                done += got.value
+            burst_ms.append((time.perf_counter() - t0) * 1e3)
+        n = bursts * batch
+        log(f"    ReadFile calls that returned with the data already there (synchronous): {sync_n} of {n} "
+            f"({100.0 * sync_n / n:.0f}%)")
+        log(f"    time inside one ReadFile call: p50 {pct(call_ms, .5):.3f} ms, p90 {pct(call_ms, .9):.3f} ms, "
+            f"max {max(call_ms):.3f} ms")
+        log(f"    whole burst ({batch} reads issued from one thread, all completions collected): p50 "
+            f"{pct(burst_ms, .5):.2f} ms, p90 {pct(burst_ms, .9):.2f} ms, max {max(burst_ms):.2f} ms")
+    finally:
+        k32.CloseHandle(port)
+        k32.CloseHandle(h)
+
+
+def spinners(n, log):
+    """n busy processes on logical CPUs 0..n-1 (the i5-13600K's P-core threads come first), as the engine's expert
+    pool spins on the P-cores while it decodes."""
+    procs = []
+    for i in range(n):
+        p = subprocess.Popen([sys.executable, "-c", "while True: pass"])
+        if WIN:
+            h = k32.OpenProcess(0x0200 | 0x0400, False, p.pid)   # SET_INFORMATION | QUERY_INFORMATION
+            k32.SetProcessAffinityMask(h, ctypes.c_size_t(1 << i))
+            k32.CloseHandle(h)
+        procs.append(p)
+    log(f"\n--- with {n} busy processes pinned to logical CPUs 0-{n - 1} (like the engine's CPU expert pool)")
+    return procs
 
 
 def ps(log, cmd):
@@ -149,6 +275,8 @@ def main() -> int:
     ap.add_argument("--config", default=str(ROOT / "strata-unsloth-ud-q4_k_xl.json"))
     ap.add_argument("--file", action="append", help="another file to test (repeatable)")
     ap.add_argument("--log", default=str(ROOT / "v100_disktest.log"))
+    ap.add_argument("--no-load", action="store_true", help="skip the run with busy CPU threads")
+    ap.add_argument("--full", action="store_true", help="also the earlier tests (thread pool, idle gaps, busy CPU)")
     a = ap.parse_args()
     log = Log(a.log)
     log(f"==== v100_disktest {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -173,11 +301,29 @@ def main() -> int:
                 "EncryptionMethod | Format-Table -AutoSize | Out-String -Width 200")
         ps(log, "powercfg /query SCHEME_CURRENT SUB_DISK 2>$null | Select-String -Pattern 'Name|Current AC' | "
                 "Out-String -Width 200")
+    if WIN and ple:
+        try:
+            overlapped_test(ple[0], log)
+            overlapped_test(ple[0], log, gap=0.0)
+        except Exception as e:  # noqa: BLE001
+            log(f"    overlapped test failed: {e!r}")
+    if not a.full:
+        log("\ndone (--full repeats the earlier tests)")
+        return 0
     for t in targets:
         try:
             test_file(t, log)
         except Exception as e:  # noqa: BLE001
             log(f"    {t}: failed: {e!r}")
+    if ple and not a.no_load:
+        procs = spinners(11, log)
+        try:
+            test_file(ple[0], log, n_qd1=500, batches=20)
+        except Exception as e:  # noqa: BLE001
+            log(f"    failed: {e!r}")
+        finally:
+            for p in procs:
+                p.kill()
     log("\ndone")
     return 0
 

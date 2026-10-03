@@ -1,0 +1,126 @@
+[
+ {
+  "variant": "baseline",
+  "what": "the config as it is (4070S layers 0-16, V100 the rest)",
+  "load_s": 109.8,
+  "short_tok_s": 56.76,
+  "short_all": [
+   62.72,
+   52.48,
+   55.35,
+   69.86,
+   55.52,
+   58.0
+  ],
+  "long_tok_s": 55.03,
+  "long": [
+   {
+    "tok_s": 53.31,
+    "n": 300,
+    "hit": 76.72815186246419,
+    "acc": 160,
+    "off": 208
+   },
+   {
+    "tok_s": 56.76,
+    "n": 300,
+    "hit": 81.11010174418605,
+    "acc": 160,
+    "off": 203
+   }
+  ]
+ },
+ {
+  "variant": "ple_shard",
+  "what": "the PLE table read from the model's shard 2 again (no --ple-gguf: the mapped file)",
+  "load_s": 112.8,
+  "short_tok_s": 57.29,
+  "short_all": [
+   58.19,
+   45.78,
+   49.48,
+   67.32,
+   56.39,
+   58.92
+  ],
+  "long_tok_s": 47.46,
+  "long": [
+   {
+    "tok_s": 46.57,
+    "n": 300,
+    "hit": 76.56425561797752,
+    "acc": 161,
+    "off": 215
+   },
+   {
+    "tok_s": 48.35,
+    "n": 300,
+    "hit": 81.57914201183432,
+    "acc": 160,
+    "off": 197
+   }
+  ]
+ },
+ {
+  "variant": "baseline_end",
+  "what": "the config again, last (how much the numbers drift over the run)",
+  "load_s": 107.6,
+  "short_tok_s": 59.82,
+  "short_all": [
+   63.34,
+   52.94,
+   56.02,
+   70.61,
+   57.67,
+   61.97
+  ],
+  "long_tok_s": 52.6,
+  "long": [
+   {
+    "tok_s": 49.47,
+    "n": 300,
+    "hit": 76.82432432432432,
+    "acc": 159,
+    "off": 227
+   },
+   {
+    "tok_s": 55.73,
+    "n": 300,
+    "hit": 78.62335359675785,
+    "acc": 171,
+    "off": 198
+   }
+  ]
+ },
+ {
+  "variant": "ple_shard_end",
+  "what": "the PLE table from shard 2 again, last",
+  "load_s": 105.9,
+  "short_tok_s": 56.23,
+  "short_all": [
+   58.85,
+   46.39,
+   50.23,
+   67.99,
+   56.63,
+   55.83
+  ],
+  "long_tok_s": 51.0,
+  "long": [
+   {
+    "tok_s": 48.97,
+    "n": 300,
+    "hit": 75.74895251396649,
+    "acc": 168,
+    "off": 226
+   },
+   {
+    "tok_s": 53.02,
+    "n": 300,
+    "hit": 81.3984674329502,
+    "acc": 166,
+    "off": 211
+   }
+  ]
+ }
+]

@@ -1,0 +1,126 @@
+[
+ {
+  "variant": "baseline",
+  "what": "the config as it is (4070S layers 0-16, V100 the rest)",
+  "load_s": 106.8,
+  "short_tok_s": 55.69,
+  "short_all": [
+   56.65,
+   49.11,
+   49.67,
+   69.1,
+   54.72,
+   58.15
+  ],
+  "long_tok_s": 50.52,
+  "long": [
+   {
+    "tok_s": 48.84,
+    "n": 300,
+    "hit": 75.17260174418605,
+    "acc": 164,
+    "off": 207
+   },
+   {
+    "tok_s": 52.19,
+    "n": 300,
+    "hit": 81.90724206349206,
+    "acc": 157,
+    "off": 193
+   }
+  ]
+ },
+ {
+  "variant": "nothrottle",
+  "what": "Windows power throttling (EcoQoS) turned off for the engine process",
+  "load_s": 110.0,
+  "short_tok_s": 54.95,
+  "short_all": [
+   57.14,
+   49.55,
+   50.69,
+   64.5,
+   52.76,
+   62.6
+  ],
+  "long_tok_s": 50.3,
+  "long": [
+   {
+    "tok_s": 47.27,
+    "n": 300,
+    "hit": 76.00992613111727,
+    "acc": 159,
+    "off": 220
+   },
+   {
+    "tok_s": 53.32,
+    "n": 300,
+    "hit": 82.29733131923464,
+    "acc": 160,
+    "off": 191
+   }
+  ]
+ },
+ {
+  "variant": "highprio",
+  "what": "the engine process at high priority",
+  "load_s": 112.4,
+  "short_tok_s": 55.81,
+  "short_all": [
+   57.4,
+   47.1,
+   47.6,
+   67.54,
+   54.44,
+   57.19
+  ],
+  "long_tok_s": 47.07,
+  "long": [
+   {
+    "tok_s": 45.27,
+    "n": 300,
+    "hit": 75.84308999081726,
+    "acc": 154,
+    "off": 215
+   },
+   {
+    "tok_s": 48.87,
+    "n": 300,
+    "hit": 79.54642857142858,
+    "acc": 165,
+    "off": 214
+   }
+  ]
+ },
+ {
+  "variant": "baseline_end",
+  "what": "the config again, last (how much the numbers drift over the run)",
+  "load_s": 110.1,
+  "short_tok_s": 54.84,
+  "short_all": [
+   57.5,
+   47.24,
+   49.35,
+   69.33,
+   52.19,
+   61.71
+  ],
+  "long_tok_s": 50.92,
+  "long": [
+   {
+    "tok_s": 48.52,
+    "n": 300,
+    "hit": 76.69285381750466,
+    "acc": 162,
+    "off": 220
+   },
+   {
+    "tok_s": 53.31,
+    "n": 300,
+    "hit": 80.78578578578579,
+    "acc": 162,
+    "off": 195
+   }
+  ]
+ }
+]

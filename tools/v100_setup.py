@@ -144,14 +144,31 @@ def main() -> int:
         # 114K prompt (16384: 758)
         # v100_decodebench2 (2026-10-03): at most 32 adaptive swaps per round - 55.6 / 46.3 tok/s (short / after 60K)
         # against 52.4 / 40.9 with 96 (the swaps share the V100's x4 link with decoding)
+        # v100_decodebench3/4 (2026-10-03): --spec-min-p 0.7 was a little ahead in every round; layers 0-19 on the
+        # 4070 Super decode as fast as 0-16 (17-22 are within the noise) and read prompts ~7% faster (the V100
+        # streams fewer layers' experts)
         for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11"), ("--prefill", "auto:32768"),
-                          ("--adapt-swaps", "32")):
+                          ("--adapt-swaps", "32"), ("--spec-min-p", "0.7")):
             if flag in c["args"]:
                 c["args"][c["args"].index(flag) + 1] = val
             else:
                 c["args"] += [flag, val]
+        if isinstance(c.get("gpu"), list) and len(c["gpu"]) == 2:
+            c["layer_split"] = "20"
+        # the PLE table in a file of its own (tools/v100_ple_split.py), when it has been made: setup's config
+        # reads it from the shard, which the engine also maps
+        if "--native" in c["args"]:
+            nat = Path(c["args"][c["args"].index("--native") + 1])
+            own = sorted(nat.parent.glob("*-ple-table.gguf"))
+            if own:
+                if "--ple-gguf" in c["args"]:
+                    c["args"][c["args"].index("--ple-gguf") + 1] = str(own[0])
+                else:
+                    c["args"] += ["--ple-gguf", str(own[0])]
+                log(f"  the PLE table from its own file: {own[0].name}")
         cfg.write_text(json.dumps(c, indent=1), encoding="utf-8")
-        log("  tuned for this PC: --pool-affinity auto --pool-workers 11 --prefill auto:32768 --adapt-swaps 32")
+        log("  tuned for this PC: --pool-affinity auto --pool-workers 11 --prefill auto:32768 --adapt-swaps 32 "
+            "--spec-min-p 0.7, layer_split 20")
     if cfg.exists():
         log(cfg.read_text(encoding="utf-8"))
     return rc

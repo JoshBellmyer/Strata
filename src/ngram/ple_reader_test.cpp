@@ -3,9 +3,15 @@
 //   ple_reader_test --selftest [--dir D]        synthetic table file; CPU and disk only, no model, no GPU
 //   ple_reader_test --gguf SHARD2 [--rows N]    the real table: Direct vs Mmap bytes for N random rows (+ the
 //                                               16 rows of every token in --tokens FILE), with read latencies
+//   ple_reader_test --gguf SHARD2 --map-only [--touch-mb M] [--gap-ms G]
+//                                               V100 fork: the direct reads only, timed, while a mapping of the
+//                                               WHOLE file stays alive (as the engine's expert/dense mapping of
+//                                               Unsloth's shard 2, which also holds layers), optionally with M MB of
+//                                               it touched outside the table; G ms between tokens' reads
 //
 // Every row the synthetic table holds encodes its own index, so a wrong offset, a straddle mishandled or a
 // dedup slot mixed up shows as a mismatch rather than as plausible data.
+#include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -14,7 +20,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <filesystem>
+#include <memory>
 #include <fstream>
 #include <random>
 #include <sstream>
@@ -193,8 +201,27 @@ int selftest(const std::string& dir) {
 }
 
 int real(const std::string& gguf, int n_random, const std::string& tokens_path, uint32_t inflight, bool direct_first,
-         bool direct_only, bool sync_submit) {
+         bool direct_only, bool sync_submit, bool map_only = false, int touch_mb = 0, int gap_ms = 0) {
     k::PleTable mm, direct;
+    // V100 fork: a whole-file mapping that only stays alive (and is optionally touched outside the table)
+    std::unique_ptr<strata::GgufFile> whole;
+    if (map_only) {
+        direct_only = true;
+        whole = std::make_unique<strata::GgufFile>(gguf);
+        uint64_t sum = 0;
+        if (touch_mb > 0) {
+            const strata::TensorInfo* tbl = whole->find("per_layer_token_embd.weight");
+            for (const auto& t : whole->tensors()) {
+                if (&t == tbl) continue;
+                const uint8_t* p = whole->tensor_data(t);
+                const uint64_t n = std::min<uint64_t>(whole->file_size() - whole->data_start() - t.offset, (uint64_t) touch_mb << 20);
+                for (uint64_t o = 0; o < n; o += 4096) sum += p[o];
+                break;                                  // the first other tensor: M MB of it
+            }
+        }
+        std::printf("a mapping of the whole file is alive%s (sum %llu)\n",
+                    touch_mb > 0 ? ", some of it touched" : "", (unsigned long long) sum);
+    }
     std::string err;
     k::PleIoOptions mo;
     mo.mode = k::PleIo::Mmap;
@@ -230,7 +257,10 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path, 
     }
     std::vector<float> a(k::NG_N_EMBD), b(k::NG_N_EMBD);
     double t_mm = 0, t_dir = 0, t_issue = 0;
+    std::vector<double> per_token;
     for (const auto& r : tickets) {
+        if (gap_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(gap_ms));
+        const double tt0 = now_us();
         for (int pass = 0; pass < 2; ++pass) {
             const bool do_direct = (pass == 0) == direct_first;
             const double t0 = now_us();
@@ -249,8 +279,14 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path, 
                 t_dir += now_us() - t0;
             }
         }
+        per_token.push_back(now_us() - tt0);
         if (!direct_only)
             CHECK(!std::memcmp(a.data(), b.data(), a.size() * sizeof(float)), "token rows differ between mmap and direct");
+    }
+    if (!per_token.empty()) {
+        std::sort(per_token.begin(), per_token.end());
+        std::printf("per token (16 rows, all reads at once): p50 %.0f us, p90 %.0f us, max %.0f us\n",
+                    per_token[per_token.size() / 2], per_token[per_token.size() * 9 / 10], per_token.back());
     }
     std::printf("tokens %zu: mmap %.1f us/token, direct %.1f us/token (issue on this thread %.1f us)\n%s\n",
                 tickets.size(), t_mm / (double) tickets.size(), t_dir / (double) tickets.size(),
@@ -269,6 +305,8 @@ int main(int argc, char** argv) {
     bool direct_only = false;
     bool sync_submit = false;
     bool self = false;
+    bool map_only = false;
+    int touch_mb = 0, gap_ms = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") self = true;
@@ -280,10 +318,14 @@ int main(int argc, char** argv) {
         else if (a == "--direct-first") direct_first = true;
         else if (a == "--direct-only") direct_only = true;
         else if (a == "--sync") sync_submit = true;
+        else if (a == "--map-only") map_only = true;
+        else if (a == "--touch-mb" && i + 1 < argc) touch_mb = std::atoi(argv[++i]);
+        else if (a == "--gap-ms" && i + 1 < argc) gap_ms = std::atoi(argv[++i]);
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
     }
     if (self) return selftest(dir);
-    if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit);
+    if (!gguf.empty())
+        return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit, map_only, touch_mb, gap_ms);
     std::fprintf(stderr, "nothing to do\n");
     return 2;
 }

@@ -70,10 +70,10 @@ index 0da642f..1229072 100644
  
 diff --git a/docs/V100.md b/docs/V100.md
 new file mode 100644
-index 0000000..bf9d8c4
+index 0000000..c681830
 --- /dev/null
 +++ b/docs/V100.md
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,317 @@
 +# Tesla V100 + RTX 4070 Super + 96 GB RAM (this fork)
 +
 +This fork runs Unsloth's **UD-Q4_K_XL** of Qwen3.8-Flash-Next ([UNSLOTH_Q4.md](UNSLOTH_Q4.md)) on one specific PC:
@@ -345,6 +345,46 @@ index 0000000..bf9d8c4
 +  NVMe SSD answers in ~0.05-0.2 ms), and a bigger row cache does not help (most reads are first-time rows).
 +  `v100\9_disk_test.bat` (no GPU) measures the drive outside the engine.
 +
++### Round 4 (2026-10-03, `v100_decodebench4.log`; two samples after 60K per run)
++
++| Variant | Short chats | After 60K | 60K prompt |
++| --- | ---: | ---: | ---: |
++| config (K=17), first / last | 55.3 / 53.8 | 47.4 / 48.9 | 91 s |
++| K=20 | 55.7 | 47.7 | 85 s |
++| **K=20 + `--spec-min-p 0.7` (now the config)** | **56.7** | **49.5** | 85 s |
++| K=22 / K=24 | 53.6 / 52.1 | 48.9 / 47.2 | 83 / 81 s |
++| `--spec-min-p 0.7` | 54.9 | 48.3 | 91 s |
++| page-locked + `--pcie-frac 0.2` | 43.1 | 47.7 | 90 s |
++
++The split point and the draft length move decode by about the noise now; K=17-22 are equal for writing. K=20 is
++kept because the V100 then streams fewer layers' experts while reading a prompt (91 -> 85 s for 60K tokens), and
++`--spec-min-p 0.7` was slightly ahead in all three rounds. Settings are exhausted: the rest is engine work (the PLE
++reads, the CPU experts, the per-layer GPU latency).
++
++## The PLE table in a file of its own (2026-10-03)
++
++Layer 1's n-gram (PLE) table is read from the SSD while decoding: 16 rows of 90 B per token, before every verify
++window. In Unsloth's layout the 28.8 GB table shares shard 2 with 296 other tensors, and the engine keeps a mapping of
++that whole shard (experts and dense weights in place). On Windows, unbuffered reads of a file that also has a live
++mapping take a much slower path. The engine logged 4-6 ms per read (p50), where the drive answers in ~0.2 ms; ISTA's
++original layout had the table alone in its shard, which no one maps, so upstream never met this.
++
++`tools/v100_ple_split.py` (`v100\13_ple_split.bat`, no GPU) measured it with the engine's own reader
++(`ple_reader_test --map-only`, new): 16 rows per token every 40 ms took 0.78 ms with nothing mapped and 2.43 ms with
++the shard mapped. It then copies the table byte for byte into a one-tensor GGUF next to the shards
++(`*-ple-table.gguf`, architecture `strata-ple`, the form `--ple-gguf` already accepts), checks 4,002 rows, and sets
++`--ple-gguf` in the config (`v100_setup.py` keeps it; `--undo` reverts). From its own file: 0.55 ms per token.
++
++`v100_decodebench7.log` (config with the table file, vs `--ple-gguf` removed; each twice, alternating):
++
++| | Short chats | After 60K | 60K prompt | PLE wait per window | PLE read p50 |
++| --- | ---: | ---: | ---: | ---: | ---: |
++| table from the shard (before) | 57.3 / 56.2 | 47.5 / 51.0 | 85 s | 4-8 ms | 3.6-6.5 ms |
++| **table from its own file** | **56.8 / 59.8** | **55.0 / 52.6** | **67 s** | **0.1-1.1 ms** | **0.2-0.8 ms** |
++
++Same rows, same answers. Writing is ~5-10% faster (first runs of each chat +8-14%, when the rows are not cached
++yet), and reading a long prompt ~20% faster (~880 vs ~700 tok/s), since the prompt path reads the same table.
++
 +## Not done yet (worth doing once the logs are in)
 +
 +- The V100 in a CPU-wired slot (x8): halves its share of the prompt time.
@@ -572,6 +612,117 @@ index e5f85bf..45b6564 100644
      }
  #if defined(__HIPCC__)
      // the tensor-core kernels are compiled out on AMD (its major version is not a CUDA sm); RDNA4 has its own int8-KV
+diff --git a/src/ngram/ple_reader_test.cpp b/src/ngram/ple_reader_test.cpp
+index 9322dc1..98fe609 100644
+--- a/src/ngram/ple_reader_test.cpp
++++ b/src/ngram/ple_reader_test.cpp
+@@ -3,9 +3,15 @@
+ //   ple_reader_test --selftest [--dir D]        synthetic table file; CPU and disk only, no model, no GPU
+ //   ple_reader_test --gguf SHARD2 [--rows N]    the real table: Direct vs Mmap bytes for N random rows (+ the
+ //                                               16 rows of every token in --tokens FILE), with read latencies
++//   ple_reader_test --gguf SHARD2 --map-only [--touch-mb M] [--gap-ms G]
++//                                               V100 fork: the direct reads only, timed, while a mapping of the
++//                                               WHOLE file stays alive (as the engine's expert/dense mapping of
++//                                               Unsloth's shard 2, which also holds layers), optionally with M MB of
++//                                               it touched outside the table; G ms between tokens' reads
+ //
+ // Every row the synthetic table holds encodes its own index, so a wrong offset, a straddle mishandled or a
+ // dedup slot mixed up shows as a mismatch rather than as plausible data.
++#include "strata/artifact/gguf_reader.hpp"
+ #include "strata/kernels/ngram.hpp"
+ #include "strata/ngram/ple_reader.hpp"
+ #include "strata/platform/direct_file.hpp"
+@@ -14,7 +20,9 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <algorithm>
+ #include <filesystem>
++#include <memory>
+ #include <fstream>
+ #include <random>
+ #include <sstream>
+@@ -193,8 +201,27 @@ int selftest(const std::string& dir) {
+ }
+ 
+ int real(const std::string& gguf, int n_random, const std::string& tokens_path, uint32_t inflight, bool direct_first,
+-         bool direct_only, bool sync_submit) {
++         bool direct_only, bool sync_submit, bool map_only = false, int touch_mb = 0, int gap_ms = 0) {
+     k::PleTable mm, direct;
++    // V100 fork: a whole-file mapping that only stays alive (and is optionally touched outside the table)
++    std::unique_ptr<strata::GgufFile> whole;
++    if (map_only) {
++        direct_only = true;
++        whole = std::make_unique<strata::GgufFile>(gguf);
++        uint64_t sum = 0;
++        if (touch_mb > 0) {
++            const strata::TensorInfo* tbl = whole->find("per_layer_token_embd.weight");
++            for (const auto& t : whole->tensors()) {
++                if (&t == tbl) continue;
++                const uint8_t* p = whole->tensor_data(t);
++                const uint64_t n = std::min<uint64_t>(whole->file_size() - whole->data_start() - t.offset, (uint64_t) touch_mb << 20);
++                for (uint64_t o = 0; o < n; o += 4096) sum += p[o];
++                break;                                  // the first other tensor: M MB of it
++            }
++        }
++        std::printf("a mapping of the whole file is alive%s (sum %llu)\n",
++                    touch_mb > 0 ? ", some of it touched" : "", (unsigned long long) sum);
++    }
+     std::string err;
+     k::PleIoOptions mo;
+     mo.mode = k::PleIo::Mmap;
+@@ -230,7 +257,10 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path,
+     }
+     std::vector<float> a(k::NG_N_EMBD), b(k::NG_N_EMBD);
+     double t_mm = 0, t_dir = 0, t_issue = 0;
++    std::vector<double> per_token;
+     for (const auto& r : tickets) {
++        if (gap_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(gap_ms));
++        const double tt0 = now_us();
+         for (int pass = 0; pass < 2; ++pass) {
+             const bool do_direct = (pass == 0) == direct_first;
+             const double t0 = now_us();
+@@ -249,9 +279,15 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path,
+                 t_dir += now_us() - t0;
+             }
+         }
++        per_token.push_back(now_us() - tt0);
+         if (!direct_only)
+             CHECK(!std::memcmp(a.data(), b.data(), a.size() * sizeof(float)), "token rows differ between mmap and direct");
+     }
++    if (!per_token.empty()) {
++        std::sort(per_token.begin(), per_token.end());
++        std::printf("per token (16 rows, all reads at once): p50 %.0f us, p90 %.0f us, max %.0f us\n",
++                    per_token[per_token.size() / 2], per_token[per_token.size() * 9 / 10], per_token.back());
++    }
+     std::printf("tokens %zu: mmap %.1f us/token, direct %.1f us/token (issue on this thread %.1f us)\n%s\n",
+                 tickets.size(), t_mm / (double) tickets.size(), t_dir / (double) tickets.size(),
+                 t_issue / (double) tickets.size(), direct.io_report().c_str());
+@@ -269,6 +305,8 @@ int main(int argc, char** argv) {
+     bool direct_only = false;
+     bool sync_submit = false;
+     bool self = false;
++    bool map_only = false;
++    int touch_mb = 0, gap_ms = 0;
+     for (int i = 1; i < argc; ++i) {
+         const std::string a = argv[i];
+         if (a == "--selftest") self = true;
+@@ -280,10 +318,14 @@ int main(int argc, char** argv) {
+         else if (a == "--direct-first") direct_first = true;
+         else if (a == "--direct-only") direct_only = true;
+         else if (a == "--sync") sync_submit = true;
++        else if (a == "--map-only") map_only = true;
++        else if (a == "--touch-mb" && i + 1 < argc) touch_mb = std::atoi(argv[++i]);
++        else if (a == "--gap-ms" && i + 1 < argc) gap_ms = std::atoi(argv[++i]);
+         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
+     }
+     if (self) return selftest(dir);
+-    if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit);
++    if (!gguf.empty())
++        return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit, map_only, touch_mb, gap_ms);
+     std::fprintf(stderr, "nothing to do\n");
+     return 2;
+ }
 diff --git a/src/prefill/gemm.cu b/src/prefill/gemm.cu
 index cfa966a..d156e59 100644
 --- a/src/prefill/gemm.cu
@@ -1812,10 +1963,10 @@ index 0000000..43e0977
 +    sys.exit(main())
 diff --git a/tools/v100_decodebench.py b/tools/v100_decodebench.py
 new file mode 100644
-index 0000000..904c3e9
+index 0000000..991de8c
 --- /dev/null
 +++ b/tools/v100_decodebench.py
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,281 @@
 +"""V100 fork: where the decode (writing) time goes on the 4070 Super + V100 split, and what changes it.
 +
 +Every variant restarts the engine with one change against the config (strata-unsloth-ud-q4_k_xl.json, 256K context)
@@ -1827,7 +1978,7 @@ index 0000000..904c3e9
 +engine logs ms per verify window split into waiting for the GPUs, the CPU experts, the draft, and per layer-window how
 +many experts the CPU computed, VRAM hits and PCIe sends.  Those lines are copied from the engine log into this log.
 +
-+    .venv\\Scripts\\python tools\\v100_decodebench.py                    (what v100\\10_decode_split.bat runs)
++    .venv\\Scripts\\python tools\\v100_decodebench.py                    (what v100\\11_decode_ple.bat runs)
 +    ... --variants baseline,v100_only --long-tokens 100000
 +"""
 +from __future__ import annotations
@@ -1903,7 +2054,68 @@ index 0000000..904c3e9
 +    "pagelock_p20": ("the RAM copy page-locked, and only 20% of CUDA0's misses over PCIe (--pcie-frac 0.2)",
 +                     {"--pcie-frac": "0.2"}, {"STRATA_ARENA_PIN_GIB": "0"}, None),
 +})
-+DEFAULT_ORDER = ["baseline", "k20", "k20_minp07", "k22", "k24", "minp07", "pagelock_p20", "baseline_end"]
++# round 5 (2026-10-03): the PLE row reads (4-6 ms per window inside the engine; the drive answers a 48-read burst in
++# under 2 ms outside it).  The config is now K=20 + --spec-min-p 0.7.
++VARIANTS.update({
++    "io48": ("48 threads issue the PLE reads (STRATA_IO_THREADS=48; default 4)", {}, {"STRATA_IO_THREADS": "48"}, None),
++    "io16": ("16 threads issue the PLE reads (STRATA_IO_THREADS=16)", {}, {"STRATA_IO_THREADS": "16"}, None),
++    "plesync": ("the PLE reads submitted on the decode thread, no I/O worker (--ple-sync-submit)", {}, {},
++                lambda cfg: cfg["args"].append("--ple-sync-submit")),
++    "keepalive5": ("the SSD kept awake with a read after 5 ms without one (STRATA_SSD_KEEPALIVE=5; default 100)", {},
++                   {"STRATA_SSD_KEEPALIVE": "5"}, None),
++})
++# Applied to the running engine once it has loaded (Windows): whether Windows slows the engine's sleeping threads
++# (the PLE reader wakes ~5 threads per decode window).  The disk test read the same file 3-10x faster from a console
++# window than the engine does.
++def _proc(pid, access):
++    import ctypes
++    k = ctypes.WinDLL("kernel32", use_last_error=True)
++    k.OpenProcess.restype = ctypes.c_void_p
++    h = k.OpenProcess(access, False, pid)
++    if not h:
++        raise OSError(ctypes.get_last_error(), "OpenProcess")
++    return k, h
++
++
++def no_throttle(pid):
++    """Power throttling (EcoQoS) off for the engine: SetProcessInformation(ProcessPowerThrottling), the execution
++    speed and timer-resolution controls set, their states cleared."""
++    import ctypes
++
++    class PPTS(ctypes.Structure):
++        _fields_ = [("Version", ctypes.c_ulong), ("ControlMask", ctypes.c_ulong), ("StateMask", ctypes.c_ulong)]
++    k, h = _proc(pid, 0x0200)   # PROCESS_SET_INFORMATION
++    st = PPTS(1, 0x1 | 0x4, 0)
++    k.SetProcessInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
++    ok = k.SetProcessInformation(h, 4, ctypes.byref(st), ctypes.sizeof(st))
++    err = ctypes.get_last_error()
++    k.CloseHandle(ctypes.c_void_p(h))
++    return f"power throttling off for pid {pid}: {'ok' if ok else f'FAILED ({err})'}"
++
++
++def high_priority(pid):
++    import ctypes
++    k, h = _proc(pid, 0x0200)
++    k.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
++    ok = k.SetPriorityClass(h, 0x80)   # HIGH_PRIORITY_CLASS
++    err = ctypes.get_last_error()
++    k.CloseHandle(ctypes.c_void_p(h))
++    return f"high priority class for pid {pid}: {'ok' if ok else f'FAILED ({err})'}"
++
++
++POST_START = {"nothrottle": no_throttle, "highprio": high_priority}
++VARIANTS.update({
++    "nothrottle": ("Windows power throttling (EcoQoS) turned off for the engine process", {}, {}, None),
++    "highprio": ("the engine process at high priority", {}, {}, None),
++})
++DEFAULT_ORDER = ["baseline", "io48", "io16", "plesync", "keepalive5", "baseline_end"]   # step 11; step 12 names its own
++# round 7 (2026-10-03): the PLE table from its own file (config --ple-gguf, tools/v100_ple_split.py) against the
++# table read from Unsloth's shard 2, which the engine also maps
++VARIANTS.update({
++    "ple_shard": ("the PLE table read from the model's shard 2 again (no --ple-gguf: the mapped file)",
++                  {"--ple-gguf": None}, {}, None),
++    "ple_shard_end": ("the PLE table from shard 2 again, last", {"--ple-gguf": None}, {}, None),
++})
 +ENGINE_LINE_KEYS = ("ple io", "page-locked", "locked resident", "decode timing", "decode GPU stages", "strata serve: stage ", "hit rate", "layer split auto",
 +                    "expert cache ", "layer split: CUDA", "strata serve: prompt ", "pcie_frac", "PCIe probe",
 +                    "resident RAM mode", "ERROR", "error", "failed")
@@ -1953,6 +2165,11 @@ index 0000000..904c3e9
 +        copy_engine_lines(elog, elog_at, log)
 +        return res
 +    res["load_s"] = round(time.time() - t0, 1)
++    if name in POST_START:
++        try:
++            log("    " + POST_START[name](eng.proc.pid))
++        except Exception as e:  # noqa: BLE001
++            log("    (could not apply:", repr(e), ")")
 +    log(f"    loaded in {res['load_s']} s; INFO", json.dumps(eng.info))
 +    nvsmi(log)
 +
@@ -2033,10 +2250,10 @@ index 0000000..904c3e9
 +    sys.exit(main())
 diff --git a/tools/v100_disktest.py b/tools/v100_disktest.py
 new file mode 100644
-index 0000000..f9eae35
+index 0000000..0e0b0a5
 --- /dev/null
 +++ b/tools/v100_disktest.py
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,332 @@
 +"""V100 fork: how fast the drive with the model files answers small random reads - NO GPU USED (safe any time).
 +
 +The engine reads layer 1's n-gram (PLE) table from the second GGUF shard with unbuffered 4 KB reads: ~16 per token,
@@ -2090,6 +2307,9 @@ index 0000000..f9eae35
 +    k32.GetFileAttributesW.restype = wintypes.DWORD
 +    k32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
 +    k32.CloseHandle.argtypes = [wintypes.HANDLE]
++    k32.OpenProcess.restype = wintypes.HANDLE
++    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
++    k32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
 +    GENERIC_READ, SHARE_RW, OPEN_EXISTING = 0x80000000, 0x3, 3
 +    NO_BUFFERING, RANDOM_ACCESS = 0x20000000, 0x10000000
 +
@@ -2168,10 +2388,133 @@ index 0000000..f9eae35
 +            walls.append((time.perf_counter() - t0) * 1e3)
 +        log(f"    {batch} reads at once ({batches} batches): until the last lands p50 {pct(walls, .5):.2f} ms, "
 +            f"p90 {pct(walls, .9):.2f} ms, max {max(walls):.2f} ms")
++        # the engine's pattern while decoding: a burst every ~40 ms, the drive idle in between.  An NVMe drive that
++        # drops into a power-saving state in the gaps pays its wake-up latency on the first read of every burst.
++        for gap in (0.010, 0.040, 0.150):
++            walls = []
++            for _ in range(40):
++                time.sleep(gap)
++                offs = [rnd.randrange(blocks) * BLOCK for _ in range(batch)]
++                t0 = time.perf_counter()
++                list(pool.map(lambda i: readers[i].read(offs[i]), range(batch)))
++                walls.append((time.perf_counter() - t0) * 1e3)
++            log(f"    {batch} at once after {gap * 1000:.0f} ms idle: p50 {pct(walls, .5):.2f} ms, p90 "
++                f"{pct(walls, .9):.2f} ms, max {max(walls):.2f} ms")
 +    finally:
 +        pool.shutdown()
 +        for x in readers:
 +            x.close()
++    # one read after an idle gap: the drive's wake-up latency alone
++    r = Reader(path)
++    try:
++        for gap in (0.005, 0.020, 0.040, 0.100, 0.300):
++            lat = []
++            for _ in range(40):
++                time.sleep(gap)
++                off = rnd.randrange(blocks) * BLOCK
++                t0 = time.perf_counter()
++                r.read(off)
++                lat.append((time.perf_counter() - t0) * 1e3)
++            log(f"    one read after {gap * 1000:.0f} ms idle: p50 {pct(lat, .5):.3f} ms, p90 {pct(lat, .9):.3f} ms, "
++                f"max {max(lat):.3f} ms")
++    finally:
++        r.close()
++
++
++def overlapped_test(path: Path, log, bursts=60, batch=48, gap=0.040):
++    """The engine's way of reading (src/platform/direct_file.cpp): ONE handle opened OVERLAPPED + NO_BUFFERING,
++    every read a ReadFile with an OVERLAPPED, completions through an I/O completion port.  If a ReadFile returns
++    only when its data is there (synchronously) instead of at once with ERROR_IO_PENDING, the engine's four issuing
++    threads read four pages at a time, not 48 - a whole decode window's rows would then take ~12 drive round trips."""
++    import ctypes
++    from ctypes import wintypes
++
++    class OVERLAPPED(ctypes.Structure):
++        _fields_ = [("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t), ("Offset", wintypes.DWORD),
++                    ("OffsetHigh", wintypes.DWORD), ("hEvent", wintypes.HANDLE)]
++
++    class ENTRY(ctypes.Structure):
++        _fields_ = [("key", ctypes.c_size_t), ("ov", ctypes.c_void_p), ("internal", ctypes.c_size_t),
++                    ("bytes", wintypes.DWORD)]
++
++    k32 = ctypes.WinDLL("kernel32", use_last_error=True)   # its own prototypes (ReadFile with an OVERLAPPED)
++    k32.CreateFileW.restype = wintypes.HANDLE
++    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
++                                wintypes.DWORD, wintypes.HANDLE]
++    k32.VirtualAlloc.restype = ctypes.c_void_p
++    k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
++    k32.CloseHandle.argtypes = [wintypes.HANDLE]
++    k32.CreateIoCompletionPort.restype = wintypes.HANDLE
++    k32.CreateIoCompletionPort.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.c_size_t, wintypes.DWORD]
++    k32.GetQueuedCompletionStatusEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.ULONG,
++                                                ctypes.POINTER(wintypes.ULONG), wintypes.DWORD, wintypes.BOOL]
++    k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
++    OVERLAPPED_FLAG = 0x40000000
++    h = k32.CreateFileW(str(path), GENERIC_READ, 0x1, None, OPEN_EXISTING, NO_BUFFERING | OVERLAPPED_FLAG | RANDOM_ACCESS,
++                        None)
++    if h in (None, wintypes.HANDLE(-1).value):
++        log("    overlapped open failed:", ctypes.get_last_error())
++        return
++    port = k32.CreateIoCompletionPort(h, None, 0, 1)
++    bufs = k32.VirtualAlloc(None, batch * BLOCK, 0x3000, 0x04)
++    ovs = (OVERLAPPED * batch)()
++    entries = (ENTRY * 64)()
++    got = wintypes.ULONG(0)
++    blocks = path.stat().st_size // BLOCK - 1
++    rnd = random.Random(7)
++    sync_n = 0
++    call_ms, burst_ms = [], []
++    log(f"\n--- the engine's way: one overlapped handle + a completion port, {batch} ReadFile calls per burst, "
++        f"{gap * 1000:.0f} ms apart")
++    try:
++        for _ in range(bursts):
++            time.sleep(gap)
++            t0 = time.perf_counter()
++            for i in range(batch):
++                off = rnd.randrange(blocks) * BLOCK
++                ctypes.memset(ctypes.byref(ovs[i]), 0, ctypes.sizeof(OVERLAPPED))
++                ovs[i].Offset = off & 0xFFFFFFFF
++                ovs[i].OffsetHigh = off >> 32
++                c0 = time.perf_counter()
++                ok = k32.ReadFile(h, bufs + i * BLOCK, BLOCK, None, ctypes.byref(ovs[i]))
++                call_ms.append((time.perf_counter() - c0) * 1e3)
++                if ok:
++                    sync_n += 1
++                elif ctypes.get_last_error() != 997:   # ERROR_IO_PENDING
++                    log("    ReadFile failed:", ctypes.get_last_error())
++                    return
++            done = 0
++            while done < batch:   # every read queues one packet, synchronous or not
++                if not k32.GetQueuedCompletionStatusEx(port, entries, 64, ctypes.byref(got), 5000, False):
++                    log("    completion wait failed:", ctypes.get_last_error())
++                    return
++                done += got.value
++            burst_ms.append((time.perf_counter() - t0) * 1e3)
++        n = bursts * batch
++        log(f"    ReadFile calls that returned with the data already there (synchronous): {sync_n} of {n} "
++            f"({100.0 * sync_n / n:.0f}%)")
++        log(f"    time inside one ReadFile call: p50 {pct(call_ms, .5):.3f} ms, p90 {pct(call_ms, .9):.3f} ms, "
++            f"max {max(call_ms):.3f} ms")
++        log(f"    whole burst ({batch} reads issued from one thread, all completions collected): p50 "
++            f"{pct(burst_ms, .5):.2f} ms, p90 {pct(burst_ms, .9):.2f} ms, max {max(burst_ms):.2f} ms")
++    finally:
++        k32.CloseHandle(port)
++        k32.CloseHandle(h)
++
++
++def spinners(n, log):
++    """n busy processes on logical CPUs 0..n-1 (the i5-13600K's P-core threads come first), as the engine's expert
++    pool spins on the P-cores while it decodes."""
++    procs = []
++    for i in range(n):
++        p = subprocess.Popen([sys.executable, "-c", "while True: pass"])
++        if WIN:
++            h = k32.OpenProcess(0x0200 | 0x0400, False, p.pid)   # SET_INFORMATION | QUERY_INFORMATION
++            k32.SetProcessAffinityMask(h, ctypes.c_size_t(1 << i))
++            k32.CloseHandle(h)
++        procs.append(p)
++    log(f"\n--- with {n} busy processes pinned to logical CPUs 0-{n - 1} (like the engine's CPU expert pool)")
++    return procs
 +
 +
 +def ps(log, cmd):
@@ -2188,6 +2531,8 @@ index 0000000..f9eae35
 +    ap.add_argument("--config", default=str(ROOT / "strata-unsloth-ud-q4_k_xl.json"))
 +    ap.add_argument("--file", action="append", help="another file to test (repeatable)")
 +    ap.add_argument("--log", default=str(ROOT / "v100_disktest.log"))
++    ap.add_argument("--no-load", action="store_true", help="skip the run with busy CPU threads")
++    ap.add_argument("--full", action="store_true", help="also the earlier tests (thread pool, idle gaps, busy CPU)")
 +    a = ap.parse_args()
 +    log = Log(a.log)
 +    log(f"==== v100_disktest {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -2212,11 +2557,29 @@ index 0000000..f9eae35
 +                "EncryptionMethod | Format-Table -AutoSize | Out-String -Width 200")
 +        ps(log, "powercfg /query SCHEME_CURRENT SUB_DISK 2>$null | Select-String -Pattern 'Name|Current AC' | "
 +                "Out-String -Width 200")
++    if WIN and ple:
++        try:
++            overlapped_test(ple[0], log)
++            overlapped_test(ple[0], log, gap=0.0)
++        except Exception as e:  # noqa: BLE001
++            log(f"    overlapped test failed: {e!r}")
++    if not a.full:
++        log("\ndone (--full repeats the earlier tests)")
++        return 0
 +    for t in targets:
 +        try:
 +            test_file(t, log)
 +        except Exception as e:  # noqa: BLE001
 +            log(f"    {t}: failed: {e!r}")
++    if ple and not a.no_load:
++        procs = spinners(11, log)
++        try:
++            test_file(ple[0], log, n_qd1=500, batches=20)
++        except Exception as e:  # noqa: BLE001
++            log(f"    failed: {e!r}")
++        finally:
++            for p in procs:
++                p.kill()
 +    log("\ndone")
 +    return 0
 +
@@ -2577,6 +2940,258 @@ index 0000000..ef487b3
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+diff --git a/tools/v100_ple_split.py b/tools/v100_ple_split.py
+new file mode 100644
+index 0000000..5ac924d
+--- /dev/null
++++ b/tools/v100_ple_split.py
+@@ -0,0 +1,246 @@
++"""V100 fork: the PLE n-gram table in a file of its own - NO GPU USED.
++
++The engine reads layer 1's n-gram table (per_layer_token_embd.weight, 28.8 GB, in Unsloth's shard 2) with
++unbuffered 4 KB reads, 30-50 per decode window.  In Unsloth's layout shard 2 ALSO holds model layers, so the engine
++keeps a memory mapping of that whole file alive (the experts and dense weights are read from it in place).  On
++Windows, unbuffered reads of a file that has a live mapping take a slower path (the file system keeps the mapped,
++cached view coherent with every non-cached read).  The engine sees 4-6 ms per read; the same reads without the
++mapping took ~0.2 ms (v100_disktest).  ISTA's original layout had the table alone in its shard, which no one maps.
++
++1. measure: tests/ple_reader_test reads random rows with and without a live mapping of the whole shard;
++2. if the mapping makes them slower (or --force): copy the table, byte for byte, into a one-tensor GGUF next to the
++   shards (architecture "strata-ple", the form the engine already accepts for a table of its own), check rows of
++   both files are identical, and point the config at it (--ple-gguf).  The rows are the same bytes, so the answers
++   do not change.  Needs ~29 GB of free disk.
++
++    .venv\\Scripts\\python tools\\v100_ple_split.py            (what v100\\13_ple_split.bat runs)
++    ... --force                                                 copy even if the measurement shows no difference
++    ... --undo                                                  take --ple-gguf out of the config again
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import random
++import re
++import shutil
++import struct
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / "tools"))
++sys.path.insert(0, str(ROOT))
++WIN = os.name == "nt"
++CFG = ROOT / "strata-unsloth-ud-q4_k_xl.json"
++TABLE = "per_layer_token_embd.weight"
++
++import gguf_reader as GR  # noqa: E402
++
++
++class Log:
++    def __init__(self, path):
++        self.f = open(path, "a", encoding="utf-8")
++
++    def __call__(self, *parts):
++        line = " ".join(str(p) for p in parts)
++        print(line, flush=True)
++        self.f.write(line + "\n")
++        self.f.flush()
++
++
++def gguf_str(s: str) -> bytes:
++    b = s.encode("utf-8")
++    return struct.pack("<Q", len(b)) + b
++
++
++def find_table_shard(native: Path):
++    for p in sorted(native.parent.glob(re.sub(r"-0000\d-of-", "-0000?-of-", native.name))):
++        g = GR.GGUFFile(p)
++        for t in g.tensors:
++            if t.name == TABLE:
++                return p, g, t
++    return None, None, None
++
++
++def build_test(log) -> Path | None:
++    import setup as S
++    exe = ROOT / "build" / ("ple_reader_test.exe" if WIN else "ple_reader_test")
++    cmake = S.find_tool("cmake")
++    if cmake is None or not (ROOT / "build" / "CMakeCache.txt").exists():
++        log("  no build folder / cmake: run v100\\1_setup_and_build.bat once first")
++        return None
++    cmd = [cmake, "--build", str(ROOT / "build"), "--target", "ple_reader_test", "-j", "4"]
++    if WIN:
++        vcvars = S.find_vcvars()
++        bat = ROOT / "build-v100-pletest.bat"
++        q = lambda c: " ".join(f'"{x}"' if " " in str(x) else str(x) for x in c)  # noqa: E731
++        bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{q(cmd)}\r\n', encoding="utf-8")
++        cmd = ["cmd", "/c", str(bat)]
++    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(ROOT))
++    for line in (r.stdout + r.stderr).splitlines()[-15:]:
++        log("    " + line)
++    if r.returncode != 0 or not exe.exists():
++        log("  building ple_reader_test failed")
++        return None
++    return exe
++
++
++def run_test(exe: Path, gguf: Path, log, label, extra) -> float | None:
++    cmd = [str(exe), "--gguf", str(gguf), "--rows", "8000", "--gap-ms", "40", *extra]
++    log(f"\n  {label}: {' '.join(cmd[1:])}")
++    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
++    p50 = None
++    for line in (r.stdout + r.stderr).splitlines():
++        log("    " + line)
++        m = re.search(r"per token .*p50 (\d+) us", line)
++        if m:
++            p50 = float(m.group(1))
++    return p50
++
++
++def write_table(src: Path, g, t, out: Path, log) -> bool:
++    nbytes = t.expected_bytes()
++    if nbytes is None:
++        log(f"  {TABLE} is {t.type_name}: unknown size")
++        return False
++    start = g.data_start + t.offset
++    header = b"GGUF" + struct.pack("<IQQ", 3, 1, 1)
++    header += gguf_str("general.architecture") + struct.pack("<I", 8) + gguf_str("strata-ple")
++    header += gguf_str(TABLE) + struct.pack("<I", len(t.shape)) + struct.pack(f"<{len(t.shape)}Q", *t.shape)
++    header += struct.pack("<IQ", t.type_id, 0)
++    header += b"\0" * ((-len(header)) % 32)
++    if out.exists() and out.stat().st_size == len(header) + nbytes:
++        log(f"  {out.name} already there ({out.stat().st_size / 1e9:.1f} GB): checking it")
++        return True
++    free = shutil.disk_usage(out.parent).free
++    if free < nbytes + (2 << 30):
++        log(f"  not enough free disk: {free / 1e9:.1f} GB free, {nbytes / 1e9:.1f} GB needed")
++        return False
++    log(f"  copying {nbytes / 1e9:.1f} GB of {src.name} into {out.name} ...")
++    tmp = out.with_suffix(".partial")
++    t0 = time.time()
++    chunk = 64 << 20
++    with open(src, "rb") as fi, open(tmp, "wb") as fo:
++        fo.write(header)
++        fi.seek(start)
++        left = nbytes
++        done_mark = 0
++        while left > 0:
++            b = fi.read(min(chunk, left))
++            if not b:
++                log("  the shard ended early")
++                return False
++            fo.write(b)
++            left -= len(b)
++            if (nbytes - left) // (4 << 30) > done_mark:
++                done_mark = (nbytes - left) // (4 << 30)
++                log(f"    {(nbytes - left) / 1e9:.0f} GB")
++    os.replace(tmp, out)
++    log(f"  written in {time.time() - t0:.0f} s")
++    return True
++
++
++def check_rows(src: Path, g, t, out: Path, log, n=4000) -> bool:
++    nbytes = t.expected_bytes()
++    rows = t.shape[1]
++    rb = nbytes // rows
++    o = GR.GGUFFile(out)
++    ot = o.tensors[0]
++    if ot.name != TABLE or ot.shape != t.shape or ot.type_id != t.type_id or out.stat().st_size != o.data_start + nbytes:
++        log("  the new file's header does not match the table")
++        return False
++    rnd = random.Random(5)
++    picks = [0, rows - 1] + [rnd.randrange(rows) for _ in range(n)]
++    with open(src, "rb") as fa, open(out, "rb") as fb:
++        for r in picks:
++            fa.seek(g.data_start + t.offset + r * rb)
++            fb.seek(o.data_start + r * rb)
++            if fa.read(rb) != fb.read(rb):
++                log(f"  row {r} differs")
++                return False
++    log(f"  {len(picks)} rows (first, last and random) are byte-identical")
++    return True
++
++
++def set_config(path: Path | None, log):
++    raw = CFG.read_bytes()
++    c = json.loads(raw.decode("utf-8-sig"))
++    a = c["args"]
++    if "--ple-gguf" in a:
++        i = a.index("--ple-gguf")
++        del a[i:i + 2]
++    if path is not None:
++        a += ["--ple-gguf", str(path)]
++    txt = json.dumps(c, indent=1)
++    if b"\r\n" in raw:
++        txt = txt.replace("\n", "\r\n")
++    CFG.write_text(txt, encoding="utf-8", newline="")
++    log(f"  config: {'--ple-gguf ' + str(path) if path else 'no --ple-gguf (the table is read from the shard)'}")
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--log", default=str(ROOT / "v100_ple_split.log"))
++    ap.add_argument("--force", action="store_true")
++    ap.add_argument("--undo", action="store_true")
++    ap.add_argument("--skip-test", action="store_true")
++    ap.add_argument("--retest", action="store_true", help="only time the reads again: the shard alone, the shard "
++                    "mapped, the table's own file (after the copy has settled on the drive)")
++    a = ap.parse_args()
++    log = Log(a.log)
++    log(f"==== v100_ple_split {time.strftime('%Y-%m-%d %H:%M:%S')}")
++    if a.undo:
++        set_config(None, log)
++        return 0
++    c = json.loads(CFG.read_text(encoding="utf-8-sig"))
++    native = Path(c["args"][c["args"].index("--native") + 1])
++    src, g, t = find_table_shard(native)
++    if src is None:
++        log(f"  no shard beside {native} holds {TABLE}")
++        return 1
++    others = [x.name for x in g.tensors if x.name != TABLE]
++    log(f"  the table: {src.name}, {t.type_name} {t.shape}, {t.expected_bytes() / 1e9:.1f} GB; the shard also holds "
++        f"{len(others)} other tensors ({src.stat().st_size / 1e9:.1f} GB in all)")
++    out = src.parent / (re.sub(r"-0000\d-of-0000\d$", "", src.stem) + "-ple-table.gguf")
++    if a.retest:
++        exe = build_test(log)
++        if exe is None:
++            return 1
++        r = {"shard alone": run_test(exe, src, log, "the shard, alone", ["--direct-only"]),
++             "shard mapped": run_test(exe, src, log, "the shard, mapped", ["--map-only"])}
++        if out.exists():
++            r["own file"] = run_test(exe, out, log, "the table's own file", ["--direct-only"])
++        log("\n  per token p50 (us): " + ", ".join(f"{k} {v}" for k, v in r.items()))
++        return 0
++    go = a.force
++    exe = None if a.skip_test else build_test(log)
++    if exe is not None:
++        alone = run_test(exe, src, log, "1. the reads alone (no mapping of the file in the process)", ["--direct-only"])
++        mapped = run_test(exe, src, log, "2. the same reads with the whole shard mapped (as in the engine)",
++                          ["--map-only"])
++        touched = run_test(exe, src, log, "3. mapped, and 512 MB of the shard's layers touched",
++                           ["--map-only", "--touch-mb", "512"])
++        log(f"\n  per token p50: alone {alone} us, mapped {mapped} us, mapped+touched {touched} us")
++        worst = max(x for x in (mapped, touched) if x is not None) if (mapped or touched) else None
++        if alone and worst and worst >= 1.5 * alone:
++            log("  => the live mapping slows the reads: the table gets a file of its own")
++            go = True
++        elif not a.force:
++            log("  => no clear slowdown from the mapping; nothing copied (--force copies anyway)")
++    if not go:
++        return 0
++    if not write_table(src, g, t, out, log) or not check_rows(src, g, t, out, log):
++        return 1
++    if exe is not None:
++        run_test(exe, out, log, "4. the new file, alone", ["--direct-only"])
++    set_config(out, log)
++    log("\n  done: the engine reads the table from its own file from the next start on (--undo reverts)")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/tools/v100_prefillbench.py b/tools/v100_prefillbench.py
 new file mode 100644
 index 0000000..d46d538
@@ -2760,10 +3375,10 @@ index 0000000..d46d538
 +    sys.exit(main())
 diff --git a/tools/v100_setup.py b/tools/v100_setup.py
 new file mode 100644
-index 0000000..f087b8e
+index 0000000..e16d5f1
 --- /dev/null
 +++ b/tools/v100_setup.py
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,178 @@
 +"""V100 fork: set up UD-Q4_K_XL on an RTX 4070 Super + Tesla V100 PC, and build the GPU test programs.
 +
 +Uses NO GPU: it only asks nvidia-smi which cards are there, then runs setup (download/pack if needed, compile the
@@ -2910,17 +3525,266 @@ index 0000000..f087b8e
 +        # 114K prompt (16384: 758)
 +        # v100_decodebench2 (2026-10-03): at most 32 adaptive swaps per round - 55.6 / 46.3 tok/s (short / after 60K)
 +        # against 52.4 / 40.9 with 96 (the swaps share the V100's x4 link with decoding)
++        # v100_decodebench3/4 (2026-10-03): --spec-min-p 0.7 was a little ahead in every round; layers 0-19 on the
++        # 4070 Super decode as fast as 0-16 (17-22 are within the noise) and read prompts ~7% faster (the V100
++        # streams fewer layers' experts)
 +        for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11"), ("--prefill", "auto:32768"),
-+                          ("--adapt-swaps", "32")):
++                          ("--adapt-swaps", "32"), ("--spec-min-p", "0.7")):
 +            if flag in c["args"]:
 +                c["args"][c["args"].index(flag) + 1] = val
 +            else:
 +                c["args"] += [flag, val]
++        if isinstance(c.get("gpu"), list) and len(c["gpu"]) == 2:
++            c["layer_split"] = "20"
++        # the PLE table in a file of its own (tools/v100_ple_split.py), when it has been made: setup's config
++        # reads it from the shard, which the engine also maps
++        if "--native" in c["args"]:
++            nat = Path(c["args"][c["args"].index("--native") + 1])
++            own = sorted(nat.parent.glob("*-ple-table.gguf"))
++            if own:
++                if "--ple-gguf" in c["args"]:
++                    c["args"][c["args"].index("--ple-gguf") + 1] = str(own[0])
++                else:
++                    c["args"] += ["--ple-gguf", str(own[0])]
++                log(f"  the PLE table from its own file: {own[0].name}")
 +        cfg.write_text(json.dumps(c, indent=1), encoding="utf-8")
-+        log("  tuned for this PC: --pool-affinity auto --pool-workers 11 --prefill auto:32768 --adapt-swaps 32")
++        log("  tuned for this PC: --pool-affinity auto --pool-workers 11 --prefill auto:32768 --adapt-swaps 32 "
++            "--spec-min-p 0.7, layer_split 20")
 +    if cfg.exists():
 +        log(cfg.read_text(encoding="utf-8"))
 +    return rc
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/v100_workload.py b/tools/v100_workload.py
+new file mode 100644
+index 0000000..f83f9da
+--- /dev/null
++++ b/tools/v100_workload.py
+@@ -0,0 +1,226 @@
++"""V100 fork: run the server for your real work, with everything logged - USES BOTH GPUs (it is the server).
++
++Starts the server exactly as run-unsloth-ud-q4_k_xl.bat does (same config, port 8080, the browser page), and while
++you work it records into runs\\workload-<date-time>\\:
++  engine.log   the engine's own log, with the timing switches on: per request the prompt and writing speed, where
++               each verify window's time goes (STRATA_DECODE_TIMING / STRATA_SPLIT_TIMING), the prompt path's phases
++               per chunk (STRATA_PREFILL_TIMING), the expert tiers, the PLE reads
++  server.log   the server window's lines (the 80-character preview of your last message is blanked out)
++  gpu.csv      both GPUs every 2 s: load, memory, temperature, power, clocks, PCIe link
++  system.csv   CPU load, free RAM and disk reads every 2 s (Windows typeperf)
++  routing.bin  which experts every decode step routed to (for an expert ranking built from your own work; no text)
++  summary.txt  made when you stop: every request (context length, tokens reused, prompt and writing speed) and
++               averages by context length
++No prompt or answer text is written to any of these files.  Stop with Ctrl+C in this window when you are done; the
++summary and a zip of everything except routing.bin (which stays on your PC) are written then.
++
++    .venv\\Scripts\\python tools\\v100_workload.py                    (what v100\\15_workload.bat runs)
++    ... --no-routing      do not record the routing (saves ~4 KB per generated token)
++    ... --no-prefill-timing
++    ... -- --api-key KEY  everything after -- goes to the server
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import re
++import statistics
++import subprocess
++import sys
++import threading
++import time
++import zipfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++WIN = os.name == "nt"
++CFG = ROOT / "strata-unsloth-ud-q4_k_xl.json"
++REQ = re.compile(r"strata serve: prompt (\d+) tokens = (\d+) reused \+ (\d+) read in ([\d.]+) ms \(([\d.]+) tok/s\), "
++                 r"(\d+) generated in ([\d.]+) ms \(([\d.]+) tok/s\), drafts accepted (\d+) of (\d+)")
++DEC = re.compile(r"decode timing: (\d+) windows, avg T ([\d.]+), ([\d.]+) tokens/window, ([\d.]+) ms/window = verify "
++                 r"([\d.]+) .*?\+ stage ([\d.]+)\) \+ commit/emit ([\d.]+) \+ draft ([\d.]+); per layer-window: CPU "
++                 r"experts ([\d.]+)")
++HIT = re.compile(r"decode expert cache hit rate: ([\d.]+)%")
++REDACT = re.compile(r"last=.*$")
++
++
++def start_loggers(run: Path):
++    procs = []
++    try:
++        f = open(run / "gpu.csv", "w", encoding="utf-8")
++        procs.append((subprocess.Popen(
++            ["nvidia-smi", "--query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.used,"
++             "memory.total,temperature.gpu,power.draw,clocks.sm,clocks.mem,pcie.link.gen.current,"
++             "pcie.link.width.current", "--format=csv", "-l", "2"], stdout=f, stderr=subprocess.DEVNULL,
++            stdin=subprocess.DEVNULL), f))
++    except OSError as e:
++        print("[workload] nvidia-smi logging off:", e)
++    if WIN:
++        try:
++            procs.append((subprocess.Popen(
++                ["typeperf", r"\Processor(_Total)\% Processor Time", r"\Memory\Available MBytes",
++                 r"\Memory\Pages/sec", r"\PhysicalDisk(_Total)\Disk Reads/sec",
++                 r"\PhysicalDisk(_Total)\Disk Read Bytes/sec", r"\PhysicalDisk(_Total)\Avg. Disk sec/Read",
++                 "-si", "2", "-o", str(run / "system.csv"), "-f", "CSV", "-y"],
++                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL), None))
++        except OSError as e:
++            print("[workload] typeperf logging off:", e)
++    return procs
++
++
++def stop(procs):
++    for p, f in procs:
++        try:
++            p.terminate()
++            p.wait(10)
++        except Exception:  # noqa: BLE001
++            try:
++                p.kill()
++            except Exception:  # noqa: BLE001
++                pass
++        if f:
++            f.close()
++
++
++def bucket(n):
++    for lim, name in ((8_000, "<8K"), (32_000, "8-32K"), (64_000, "32-64K"), (128_000, "64-128K"),
++                      (200_000, "128-200K")):
++        if n < lim:
++            return name
++    return "200K+"
++
++
++def summarize(run: Path) -> str:
++    log = run / "engine.log"
++    if not log.exists():
++        return "no engine.log"
++    reqs, dec, hit = [], None, None
++    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
++        m = DEC.search(line)
++        if m:
++            dec = m
++            continue
++        m = REQ.search(line)
++        if m:
++            reqs.append({"prompt": int(m[1]), "reused": int(m[2]), "read": int(m[3]), "read_ms": float(m[4]),
++                         "pp": float(m[5]), "gen": int(m[6]), "gen_ms": float(m[7]), "tg": float(m[8]),
++                         "acc": int(m[9]), "off": int(m[10]), "dec": dec, "hit": None})
++            dec = None
++            continue
++        m = HIT.search(line)
++        if m and reqs and reqs[-1]["hit"] is None:
++            reqs[-1]["hit"] = float(m[1])
++    out = [f"workload run {run.name}: {len(reqs)} requests", ""]
++    out.append(f"{'#':>3} {'context':>8} {'reused':>8} {'read':>8} {'read s':>7} {'prompt t/s':>10} {'gen':>6} "
++               f"{'write t/s':>9} {'ms/win':>7} {'tok/win':>7} {'PLE ms':>6} {'CPU exp':>7} {'GPU hit':>7}")
++    for i, r in enumerate(reqs, 1):
++        d = r["dec"]
++        out.append(f"{i:>3} {r['prompt']:>8} {r['reused']:>8} {r['read']:>8} {r['read_ms'] / 1000:>7.1f} "
++                   f"{r['pp']:>10.1f} {r['gen']:>6} {r['tg']:>9.1f} "
++                   f"{(float(d[4]) if d else 0):>7.1f} {(float(d[3]) if d else 0):>7.2f} "
++                   f"{(float(d[6]) if d else 0):>6.1f} {(float(d[9]) if d else 0):>7.2f} "
++                   f"{(str(r['hit']) + '%') if r['hit'] is not None else '-':>7}")
++    out += ["", "by context length (requests that wrote >= 32 tokens / read >= 1000 new tokens):"]
++    groups = {}
++    for r in reqs:
++        groups.setdefault(bucket(r["prompt"]), []).append(r)
++    for name in ("<8K", "8-32K", "32-64K", "64-128K", "128-200K", "200K+"):
++        g = groups.get(name)
++        if not g:
++            continue
++        w = [r["tg"] for r in g if r["gen"] >= 32]
++        p = [r["pp"] for r in g if r["read"] >= 1000]
++        reuse = sum(r["reused"] for r in g) / max(1, sum(r["prompt"] for r in g))
++        out.append(f"  {name:>9}: {len(g)} requests; writing median "
++                   f"{statistics.median(w) if w else float('nan'):.1f} tok/s ({len(w)}); prompt reading median "
++                   f"{statistics.median(p) if p else float('nan'):.1f} tok/s ({len(p)}); {100 * reuse:.0f}% of "
++                   f"prompt tokens reused from the cache")
++    tot_gen = sum(r["gen"] for r in reqs)
++    tot_gen_s = sum(r["gen_ms"] for r in reqs) / 1000
++    tot_read = sum(r["read"] for r in reqs)
++    tot_read_s = sum(r["read_ms"] for r in reqs) / 1000
++    out += ["", f"total: {tot_gen} tokens written in {tot_gen_s:.0f} s; {tot_read} prompt tokens read in "
++                f"{tot_read_s:.0f} s; {sum(r['reused'] for r in reqs)} reused"]
++    rb = run / "routing.bin"
++    if rb.exists():
++        out.append(f"routing.bin: {rb.stat().st_size / 1e6:.0f} MB (kept on this PC)")
++    return "\n".join(out)
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--port", type=int, default=None)
++    ap.add_argument("--no-open", action="store_true")
++    ap.add_argument("--no-routing", action="store_true")
++    ap.add_argument("--no-prefill-timing", action="store_true")
++    ap.add_argument("--summarize", help="only (re)write summary.txt for this run folder")
++    ap.add_argument("server_args", nargs="*")
++    a = ap.parse_args()
++    if a.summarize:
++        run = Path(a.summarize)
++        (run / "summary.txt").write_text(summarize(run), encoding="utf-8")
++        print((run / "summary.txt").read_text(encoding="utf-8"))
++        return 0
++    run = ROOT / "runs" / time.strftime("workload-%Y%m%d-%H%M%S")
++    run.mkdir(parents=True, exist_ok=True)
++    cfg = json.loads(CFG.read_text(encoding="utf-8-sig"))
++    port = a.port or int(cfg.get("port") or 8080)
++    env = cfg.setdefault("env", {})
++    env.update({"STRATA_DECODE_TIMING": "1", "STRATA_SPLIT_TIMING": "1"})
++    if not a.no_prefill_timing:
++        env["STRATA_PREFILL_TIMING"] = "1"
++    if not a.no_routing:
++        args = cfg["args"]
++        if "--dump-routing" in args:
++            del args[args.index("--dump-routing"):args.index("--dump-routing") + 2]
++        args += ["--dump-routing", str(run / "routing.bin")]
++    cfg["log"] = str(run / "engine.log")
++    (run / "config.json").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
++    print(f"[workload] logging into {run}")
++    print(f"[workload] the server: http://127.0.0.1:{port}  -  use it as usual; press Ctrl+C here when you are done")
++    loggers = start_loggers(run)
++    cmd = [sys.executable, "-m", "serve.server", "--engine", "strata", "--config", str(run / "config.json"),
++           "--port", str(port)] + ([] if a.no_open else ["--open"]) + list(a.server_args)
++    slog = open(run / "server.log", "w", encoding="utf-8")
++    t0 = time.time()
++    srv = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
++                           encoding="utf-8", errors="replace", bufsize=1)
++
++    def pump():
++        for line in srv.stdout:
++            sys.stdout.write(line)
++            sys.stdout.flush()
++            slog.write(f"{time.strftime('%H:%M:%S')} " + REDACT.sub("last=<not logged>", line))
++            slog.flush()
++
++    th = threading.Thread(target=pump, daemon=True)
++    th.start()
++    try:
++        while srv.poll() is None:
++            time.sleep(0.5)
++    except KeyboardInterrupt:
++        print("\n[workload] stopping ...")
++        try:
++            srv.terminate()
++            srv.wait(60)
++        except Exception:  # noqa: BLE001
++            srv.kill()
++    finally:
++        stop(loggers)
++        time.sleep(1)
++        slog.close()
++        s = summarize(run)
++        (run / "summary.txt").write_text(s + f"\n\nrun length {(time.time() - t0) / 60:.0f} min\n", encoding="utf-8")
++        z = run / f"{run.name}.zip"
++        with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
++            for name in ("summary.txt", "engine.log", "server.log", "gpu.csv", "system.csv", "config.json"):
++                if (run / name).exists():
++                    zf.write(run / name, name)
++        print("\n" + s)
++        print(f"\n[workload] done. Send {z} back for review (routing.bin stays here).")
++    return 0
 +
 +
 +if __name__ == "__main__":
@@ -2944,6 +3808,100 @@ index 0000000..c154d74
 +".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench4.log %*
 +echo.
 +echo Done. Send v100_decodebench4.log back for review.
++pause
+diff --git a/v100/11_decode_ple.bat b/v100/11_decode_ple.bat
+new file mode 100644
+index 0000000..60621d9
+--- /dev/null
++++ b/v100/11_decode_ple.bat
+@@ -0,0 +1,13 @@
++@echo off
++rem V100 fork, step 11 - the PLE row reads (layer 1's table on the SSD) while decoding.
++rem   USES BOTH GPUs, ~30 minutes, nothing is compiled.  Six engine runs: the config first and last, 48 and 16 threads
++rem   issuing the reads, the reads submitted on the decode thread, and the SSD kept awake.
++rem   Logs: v100_decodebench5.log (+ .json).
++setlocal
++cd /d "%~dp0.."
++echo This uses both GPUs for about 30 minutes. Stop any other GPU program first.
++pause
++".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench5.log %*
++echo.
++echo Done. Send v100_decodebench5.log back for review.
++pause
+diff --git a/v100/12_decode_throttle.bat b/v100/12_decode_throttle.bat
+new file mode 100644
+index 0000000..ce23d98
+--- /dev/null
++++ b/v100/12_decode_throttle.bat
+@@ -0,0 +1,13 @@
++@echo off
++rem V100 fork, step 12 - whether Windows slows the engine's I/O threads while decoding.
++rem   USES BOTH GPUs, ~20 minutes, nothing is compiled.  Four engine runs: the config, Windows power throttling
++rem   (EcoQoS) off for the engine process, the engine at high priority, the config again.
++rem   Logs: v100_decodebench6.log (+ .json).
++setlocal
++cd /d "%~dp0.."
++echo This uses both GPUs for about 20 minutes. Stop any other GPU program first.
++pause
++".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench6.log --variants baseline,nothrottle,highprio,baseline_end %*
++echo.
++echo Done. Send v100_decodebench6.log back for review.
++pause
+diff --git a/v100/13_ple_split.bat b/v100/13_ple_split.bat
+new file mode 100644
+index 0000000..666bb4c
+--- /dev/null
++++ b/v100/13_ple_split.bat
+@@ -0,0 +1,12 @@
++@echo off
++rem V100 fork, step 13 - the PLE table (layer 1's n-gram table) in a file of its own.  NO GPU USED.
++rem   Builds a small test program, measures the table's reads with and without a live mapping of the model shard
++rem   (~2 minutes), and if the mapping slows them: copies the table (~29 GB, a few minutes) into its own file next
++rem   to the model, checks it byte for byte, and points the config at it.  Log: v100_ple_split.log.
++rem   Undo: 13_ple_split.bat --undo
++setlocal
++cd /d "%~dp0.."
++".venv\Scripts\python.exe" tools\v100_ple_split.py %*
++echo.
++echo Done. Send v100_ple_split.log back for review.
++pause
+diff --git a/v100/14_ple_check.bat b/v100/14_ple_check.bat
+new file mode 100644
+index 0000000..307a05b
+--- /dev/null
++++ b/v100/14_ple_check.bat
+@@ -0,0 +1,16 @@
++@echo off
++rem V100 fork, step 14 - the PLE table from its own file, measured.
++rem   Part 1 (NO GPU, ~2 minutes): the table's reads timed again, now that the copy has settled on the drive.
++rem     Log: v100_ple_split.log.
++rem   Part 2 (USES BOTH GPUs, ~25 minutes): four engine runs - the config (table from its own file), the table read
++rem     from the model's shard again, then both once more.  Log: v100_decodebench7.log.
++setlocal
++cd /d "%~dp0.."
++".venv\Scripts\python.exe" tools\v100_ple_split.py --retest
++echo.
++echo Part 2 uses both GPUs for about 25 minutes. Stop any other GPU program first.
++pause
++".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench7.log --variants baseline,ple_shard,baseline_end,ple_shard_end %*
++echo.
++echo Done. Send v100_ple_split.log and v100_decodebench7.log back for review.
++pause
+diff --git a/v100/15_workload.bat b/v100/15_workload.bat
+new file mode 100644
+index 0000000..2cefe6b
+--- /dev/null
++++ b/v100/15_workload.bat
+@@ -0,0 +1,10 @@
++@echo off
++rem V100 fork, step 15 - your real work, logged.  USES BOTH GPUs: this IS the server (port 8080, the browser page),
++rem   started the same way as run-unsloth-ud-q4_k_xl.bat, with the engine's timing switches on.  Use it as usual.
++rem   Everything goes to runs\workload-<date-time>\ (no prompt or answer text is written).
++rem   Press Ctrl+C in this window when you are done: a summary and a zip to send back are written then.
++rem   Extra server options after --, e.g.  15_workload.bat -- --api-key KEY
++setlocal
++cd /d "%~dp0.."
++".venv\Scripts\python.exe" tools\v100_workload.py %*
 +pause
 diff --git a/v100/1_setup_and_build.bat b/v100/1_setup_and_build.bat
 new file mode 100644

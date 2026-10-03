@@ -1,0 +1,188 @@
+[
+ {
+  "variant": "baseline",
+  "what": "the config as it is (4070S layers 0-16, V100 the rest)",
+  "load_s": 107.4,
+  "short_tok_s": 54.25,
+  "short_all": [
+   55.43,
+   47.98,
+   49.57,
+   69.28,
+   53.08,
+   61.77
+  ],
+  "long_tok_s": 50.7,
+  "long": [
+   {
+    "tok_s": 48.03,
+    "n": 300,
+    "hit": 75.92067988668555,
+    "acc": 162,
+    "off": 214
+   },
+   {
+    "tok_s": 53.36,
+    "n": 300,
+    "hit": 78.61295476892822,
+    "acc": 171,
+    "off": 208
+   }
+  ]
+ },
+ {
+  "variant": "io48",
+  "what": "48 threads issue the PLE reads (STRATA_IO_THREADS=48; default 4)",
+  "load_s": 107.6,
+  "short_tok_s": 55.38,
+  "short_all": [
+   56.47,
+   46.01,
+   50.15,
+   66.89,
+   54.29,
+   57.95
+  ],
+  "long_tok_s": 50.77,
+  "long": [
+   {
+    "tok_s": 47.3,
+    "n": 300,
+    "hit": 75.43196798493409,
+    "acc": 156,
+    "off": 209
+   },
+   {
+    "tok_s": 54.24,
+    "n": 300,
+    "hit": 81.99288922155688,
+    "acc": 166,
+    "off": 200
+   }
+  ]
+ },
+ {
+  "variant": "io16",
+  "what": "16 threads issue the PLE reads (STRATA_IO_THREADS=16)",
+  "load_s": 105.3,
+  "short_tok_s": 56.16,
+  "short_all": [
+   56.28,
+   45.77,
+   49.8,
+   67.89,
+   56.05,
+   62.31
+  ],
+  "long_tok_s": 50.48,
+  "long": [
+   {
+    "tok_s": 47.96,
+    "n": 300,
+    "hit": 75.54340277777777,
+    "acc": 166,
+    "off": 226
+   },
+   {
+    "tok_s": 53.01,
+    "n": 300,
+    "hit": 82.66136801541425,
+    "acc": 161,
+    "off": 206
+   }
+  ]
+ },
+ {
+  "variant": "plesync",
+  "what": "the PLE reads submitted on the decode thread, no I/O worker (--ple-sync-submit)",
+  "load_s": 106.3,
+  "short_tok_s": 55.47,
+  "short_all": [
+   56.43,
+   46.76,
+   49.06,
+   67.86,
+   54.5,
+   59.08
+  ],
+  "long_tok_s": 50.02,
+  "long": [
+   {
+    "tok_s": 48.11,
+    "n": 300,
+    "hit": 75.53019662921348,
+    "acc": 168,
+    "off": 224
+   },
+   {
+    "tok_s": 51.94,
+    "n": 300,
+    "hit": 82.12298768939394,
+    "acc": 157,
+    "off": 209
+   }
+  ]
+ },
+ {
+  "variant": "keepalive5",
+  "what": "the SSD kept awake with a read after 5 ms without one (STRATA_SSD_KEEPALIVE=5; default 100)",
+  "load_s": 107.9,
+  "short_tok_s": 56.62,
+  "short_all": [
+   56.88,
+   48.79,
+   49.33,
+   68.18,
+   56.35,
+   57.81
+  ],
+  "long_tok_s": 49.91,
+  "long": [
+   {
+    "tok_s": 48.46,
+    "n": 300,
+    "hit": 76.26750700280112,
+    "acc": 159,
+    "off": 216
+   },
+   {
+    "tok_s": 51.37,
+    "n": 300,
+    "hit": 81.35828625235405,
+    "acc": 158,
+    "off": 211
+   }
+  ]
+ },
+ {
+  "variant": "baseline_end",
+  "what": "the config again, last (how much the numbers drift over the run)",
+  "load_s": 106.0,
+  "short_tok_s": 55.8,
+  "short_all": [
+   56.29,
+   46.13,
+   50.16,
+   67.94,
+   55.3,
+   59.31
+  ],
+  "long_tok_s": 49.96,
+  "long": [
+   {
+    "tok_s": 46.55,
+    "n": 300,
+    "hit": 76.1893315018315,
+    "acc": 161,
+    "off": 225
+   },
+   {
+    "tok_s": 53.37,
+    "n": 300,
+    "hit": 82.05295138888889,
+    "acc": 161,
+    "off": 197
+   }
+  ]
+ }
+]
