@@ -1,0 +1,101 @@
+[
+ {
+  "variant": "same8k",
+  "what": "before: every stage reads 8192-token chunks (the 4070 Super's limit)",
+  "load_s": 120.2,
+  "warmup": {
+   "prompt_tokens": 15995,
+   "reused": 0,
+   "prompt_s": 42.9,
+   "prompt_tok_s": 373.0,
+   "generated": 40,
+   "decode_tok_s": 34.2,
+   "file_mb": 0.0
+  },
+  "long": {
+   "prompt_tokens": 114460,
+   "reused": 0,
+   "prompt_s": 210.8,
+   "prompt_tok_s": 543.0,
+   "generated": 9,
+   "decode_tok_s": 18.5,
+   "file_mb": 0.0,
+   "found": true
+  },
+  "followup": {
+   "prompt_tokens": 114493,
+   "reused": 114453,
+   "prompt_s": 0.6,
+   "prompt_tok_s": 71.5,
+   "generated": 160,
+   "decode_tok_s": 31.1,
+   "file_mb": 0.0
+  }
+ },
+ {
+  "variant": "v100_16k",
+  "what": "the V100 reads 16384-token chunks (two of the 4070S's gathered)",
+  "load_s": 121.2,
+  "warmup": {
+   "prompt_tokens": 15995,
+   "reused": 0,
+   "prompt_s": 45.9,
+   "prompt_tok_s": 348.2,
+   "generated": 40,
+   "decode_tok_s": 31.7,
+   "file_mb": 0.0
+  },
+  "long": {
+   "prompt_tokens": 114460,
+   "reused": 0,
+   "prompt_s": 150.9,
+   "prompt_tok_s": 758.4,
+   "generated": 10,
+   "decode_tok_s": 29.4,
+   "file_mb": 0.0,
+   "found": true
+  },
+  "followup": {
+   "prompt_tokens": 114494,
+   "reused": 114470,
+   "prompt_s": 0.4,
+   "prompt_tok_s": 61.5,
+   "generated": 160,
+   "decode_tok_s": 30.6,
+   "file_mb": 0.0
+  }
+ },
+ {
+  "variant": "v100_32k",
+  "what": "the V100 reads 32768-token chunks (four of the 4070S's gathered)",
+  "load_s": 113.9,
+  "warmup": {
+   "prompt_tokens": 15995,
+   "reused": 0,
+   "prompt_s": 41.0,
+   "prompt_tok_s": 389.8,
+   "generated": 40,
+   "decode_tok_s": 33.2,
+   "file_mb": 0.0
+  },
+  "long": {
+   "prompt_tokens": 114460,
+   "reused": 0,
+   "prompt_s": 140.7,
+   "prompt_tok_s": 813.6,
+   "generated": 9,
+   "decode_tok_s": 23.8,
+   "file_mb": 0.0,
+   "found": true
+  },
+  "followup": {
+   "prompt_tokens": 114493,
+   "reused": 114453,
+   "prompt_s": 0.5,
+   "prompt_tok_s": 77.5,
+   "generated": 160,
+   "decode_tok_s": 32.7,
+   "file_mb": 0.0
+  }
+ }
+]

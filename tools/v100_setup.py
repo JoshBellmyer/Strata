@@ -140,13 +140,15 @@ def main() -> int:
         # siblings, without the E-cores - 43.3 vs 41.0 tok/s, ahead in 4 of 6 prompts
         import json
         c = json.loads(cfg.read_text(encoding="utf-8-sig"))
-        for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11")):
+        # v100_prefillbench (2026-10-03): the V100 reads long prompts in 32768-token chunks - 814 vs 543 tok/s on a
+        # 114K prompt (16384: 758)
+        for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11"), ("--prefill", "auto:32768")):
             if flag in c["args"]:
                 c["args"][c["args"].index(flag) + 1] = val
             else:
                 c["args"] += [flag, val]
         cfg.write_text(json.dumps(c, indent=1), encoding="utf-8")
-        log("  tuned for this PC: --pool-affinity auto --pool-workers 11")
+        log("  tuned for this PC: --pool-affinity auto --pool-workers 11 --prefill auto:32768")
     if cfg.exists():
         log(cfg.read_text(encoding="utf-8"))
     return rc
