@@ -84,6 +84,15 @@ def main() -> int:
         order = f"{ada[0]['index']},{volta[0]['index']}"
     log(f"  GPU order for the layer split: {order} (the first one is CUDA0)")
     py = sys.executable
+    # your own settings in the config (a "sampling" block, "aliases", "max_tokens") - setup writes the config anew,
+    # so they are put back after it
+    keep = {}
+    try:
+        import json
+        old = json.loads((ROOT / "strata-unsloth-ud-q4_k_xl.json").read_text(encoding="utf-8-sig"))
+        keep = {k: old[k] for k in ("sampling", "aliases", "max_tokens") if k in old}
+    except (OSError, ValueError):
+        pass
     if not a.skip_setup:
         cmd = [py, str(ROOT / "setup.py"), "--setup", "--build", "--yes", "--no-start", "--family", "unsloth",
                "--model", "UD-Q4_K_XL", "--gpus", order, "--context", str(a.context), "--vision", "no",
@@ -160,6 +169,8 @@ def main() -> int:
         # clients that ask for "the rest of the context" from their own token estimate (pi after a compaction asked
         # 4K over): fit max_tokens to the room left instead of rejecting the request with a 400
         c["fit_max_tokens"] = True
+        for k, v in keep.items():
+            c.setdefault(k, v)
         if isinstance(c.get("gpu"), list) and len(c["gpu"]) == 2:
             c["layer_split"] = "20"
         # the PLE table in a file of its own (tools/v100_ple_split.py), when it has been made: setup's config

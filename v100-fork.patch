@@ -1,3 +1,64 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..5e45ecf
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,55 @@
++# Generated, not source: deterministic build products of tools/ (see docs/).
++# tiny-qwen4exp.gguf is ~113 MB, over GitHub's 100 MB file limit -- regenerate with
++#   python tools/make_tiny_model.py
++bench/tiny-*.gguf
++bench/wide-*.gguf
++bench/micro/*.exe
++bench/micro/*.obj
++bench/micro/*.bin
++bench/micro/*.dll
++bench/micro/*.txt
++*.log
++build*/
++pack/
++logs/
++__pycache__/
++.pytest_cache/
++*.pyc
++
++# plan v0.3 P1 (repository hygiene, review E1): profiler captures and large diagnostic dumps stay out of git.
++*.nsys-rep
++
++# Pi harness metadata (local session state, not project source)
++*.sqlite
++*.npz
++*.occ1
++td.log
++
++# created by setup.py on the user's machine
++/.venv/
++/build/
++/third_party/llama.cpp
++/models/
++/packs/
++/mtp/
++/run-*.bat
++/run-*.sh
++/strata-*.json
++/strata-*.log
++/build-strata.bat
++
++# image encoder (setup.py --vision): build output and the generated build script
++build-vision*/
++build-vision.bat
++
++# setup.py outputs (engine, downloads) and release builds
++/engine/
++/build-release*/
++/dist/
++*.done
++/third_party/*.zip
++
++# V100 fork: workload recordings (tools/v100_workload.py - engine logs, routing.bin of several hundred MB, zips)
++/runs/
++# the build script tools/v100_ple_split.py writes
++/build-v100-*.bat
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 0105884..41c72b9 100644
 --- a/CMakeLists.txt
@@ -70,10 +131,10 @@ index 0da642f..1229072 100644
  
 diff --git a/docs/V100.md b/docs/V100.md
 new file mode 100644
-index 0000000..c681830
+index 0000000..7a08e59
 --- /dev/null
 +++ b/docs/V100.md
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,352 @@
 +# Tesla V100 + RTX 4070 Super + 96 GB RAM (this fork)
 +
 +This fork runs Unsloth's **UD-Q4_K_XL** of Qwen3.8-Flash-Next ([UNSLOTH_Q4.md](UNSLOTH_Q4.md)) on one specific PC:
@@ -384,6 +445,41 @@ index 0000000..c681830
 +
 +Same rows, same answers. Writing is ~5-10% faster (first runs of each chat +8-14%, when the rows are not cached
 +yet), and reading a long prompt ~20% faster (~880 vs ~700 tok/s), since the prompt path reads the same table.
++
++## Your own workload: short reads, and the expert caches (2026-10-03)
++
++`v100\15_workload.bat` (`tools/v100_workload.py`) runs the server for real work with the timing switches on and
++records the decode routing (`runs\workload-*\routing.bin`, no text). The first hour (152 requests, up to 213K
++context) showed most prompt time going to small new messages read through the batched path (65-768 new tokens:
++3.6-10 s each - the V100 streams every routed expert it lacks over its x4 link); the decode windows read ~12 ms a
++token. `--short-read 768` (was 64; `v100_setup.py` sets it) made those 2-3x faster in the second run (76-130 tokens
++0.9-1.7 s, 489 tokens 5.4 s); batched stays faster above ~1,000 tokens. `"fit_max_tokens": true` lets a client ask
++for "the rest of the context" from its own (low) prompt estimate without a 400.
++
++`tools/v100_cachesim.py` (no GPU) replays that routing through a model of the caches and the adaptive tier (within
++~1.5 points of the engine's logged hit rate). The 4070 Super's cache holds 17% of its layers' experts and answers
++~55% of their lookups; the V100's holds 58% and answers ~94%, so ~85% of the CPU's expert work is the 4070 Super's
++layers. An expert profile built from the routing helped only the run it was made from (held out: -0.2 points): the
++adaptive tier already follows the conversation, and swaps stay within a layer. What does help: the shared budget of
++32 swaps per round left the 4070 Super ~17; `--adapt-stage-swaps 96,32` (new: a budget per card, CUDA0 first)
++replayed 77.0 -> 80.0%, and each extra GiB for CUDA0's cache is worth ~2 points. `v100\16_expert_cache.bat`
++benches the per-card budgets on the GPUs (`v100_decodebench8.log`).
++
++`v100_decodebench8.log` (decode windows after each variant's warm-up, summed):
++
++| | GPU hits | ms/window | CPU experts ms | 4070S pool+plan | V100 wait for GPU | tok/s |
++| --- | ---: | ---: | ---: | ---: | ---: | ---: |
++| shared 32 (config) | 73.5% | 40.6 | 13.1 | 10.8 | 14.1 | 57.8 |
++| 64,32 | 76.1% | 41.2 | 11.9 | 10.2 | 15.4 | 57.0 |
++| 96,32 | 76.4% | 40.6 | 11.7 | 9.9 | 15.0 | 57.3 |
++| 160,32 | 77.7% | 40.2 | 11.3 | 9.4 | 14.9 | 57.0 |
++| 96,16 | 74.7% | 40.1 | 12.3 | 9.7 | 13.9 | 57.4 |
++| shared 32 again | 73.4% | 39.5 | 12.7 | 10.6 | 13.9 | 57.5 |
++
++The replay was right about the hits (+4 points at 160,32) and the 4070 Super's CPU time fell ~1.4 ms a window, but
++the windows did not get shorter beyond the run-to-run drift (~1 ms): the V100's stage (~14-15 ms waiting for its
++GPU) took up the difference. The config keeps `--adapt-swaps 32`; the option stays for later. The CPU misses of
++the 4070 Super's layers are not what sets the window time now.
 +
 +## Not done yet (worth doing once the logs are in)
 +
@@ -993,7 +1089,7 @@ index 4bca216..c1fb767 100644
                               "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                               "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
 diff --git a/src/program/generate.cpp b/src/program/generate.cpp
-index 1a2f203..8531fb4 100644
+index 1a2f203..bcdf3a8 100644
 --- a/src/program/generate.cpp
 +++ b/src/program/generate.cpp
 @@ -93,6 +93,7 @@
@@ -1072,7 +1168,45 @@ index 1a2f203..8531fb4 100644
  
  struct Options {
      std::string pack = "pack/full";
-@@ -1320,10 +1345,15 @@ int main(int argc, char** argv) {
+@@ -378,6 +403,11 @@ struct Options {
+     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
+     bool vision = false;
+     int adapt_swaps = 96;
++    /// V100 fork: --adapt-stage-swaps N0,N1,..: the swap budget of each card of a layer split (CUDA0's layers first),
++    /// in place of the one --adapt-swaps budget the cards shared.  The 4070 Super's layers miss the most (its cache
++    /// holds ~17% of their experts, the V100's ~58%) and its swaps cross a x16 link; the V100's cross a x4 link that
++    /// decode also uses.  Empty: --adapt-swaps for all of them together, as before.
++    std::vector<int> adapt_stage_swaps;
+     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
+     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
+     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
+@@ -499,6 +529,8 @@ void usage() {
+                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
+                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
+                  "                       of the batched prompt path (default 64, 0 = off)\n"
++                 "  --adapt-stage-swaps N0,N1  --serve, layer split: each card's adaptive swap budget per round (CUDA0's\n"
++                 "                       layers first) instead of --adapt-swaps shared by all of them\n"
+                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
+                  "                       when it pays (default 3; 0 = MTP only)\n"
+                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
+@@ -1205,6 +1237,16 @@ int main(int argc, char** argv) {
+             o.stop_eos = true;
+         }
+         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
++        else if (a == "--adapt-stage-swaps") {
++            std::vector<int64_t> v;
++            std::string e;
++            if (!parse_i64_list(next("--adapt-stage-swaps"), v, e)) {
++                std::fprintf(stderr, "--adapt-stage-swaps: %s\n", e.c_str());
++                return 2;
++            }
++            o.adapt_stage_swaps.clear();
++            for (const int64_t x : v) o.adapt_stage_swaps.push_back((int) std::max<int64_t>(0, std::min<int64_t>(x, 512)));
++        }
+         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
+         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
+         else if (a == "--no-hit-poke") o.no_hit_poke = true;
+@@ -1320,10 +1362,15 @@ int main(int argc, char** argv) {
          std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
          return 2;
      }
@@ -1091,7 +1225,7 @@ index 1a2f203..8531fb4 100644
          return 2;
      }
      // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
-@@ -2408,7 +2438,11 @@ int main(int argc, char** argv) {
+@@ -2408,7 +2455,11 @@ int main(int argc, char** argv) {
          while (st < (int) split_at.size() && l >= split_at[(size_t) st]) ++st;
          return st;
      };
@@ -1103,12 +1237,14 @@ index 1a2f203..8531fb4 100644
          std::vector<std::pair<int32_t, int32_t>> mine;
          for (const auto& pr : profile) {
              const int st = stage_of(pr.first);
-@@ -3757,8 +3791,26 @@ int main(int argc, char** argv) {
+@@ -3757,10 +3808,33 @@ int main(int argc, char** argv) {
              const int64_t k = plan_lend(chunk);
              if (k > 0) lend_from = xcache.slots() - k;
          }
 -        if (src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
 -                                     o.resident_budget, &profile)) {
+-            if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
+-                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
 +        // a layer split: the later stages' caches hold their layers' experts on their own GPUs - none of those is
 +        // copied into RAM (the budget goes to the hottest experts no GPU holds)
 +        std::vector<std::pair<int32_t, int32_t>> stage_pairs;
@@ -1129,10 +1265,17 @@ index 1a2f203..8531fb4 100644
 +        }
 +        if (src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from, o.resident_headroom,
 +                                     o.resident_budget, multi_gpu ? &profile_all : &profile)) {
-             if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
-                 !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
++            int64_t xchg = std::min<int64_t>(o.adapt_swaps, 96);
++            if (multi_gpu && !o.adapt_stage_swaps.empty()) {   // V100 fork: every card's swaps can be exchanges
++                int64_t sum = 0;
++                for (const int x : o.adapt_stage_swaps) sum += x;
++                xchg = std::min<int64_t>(std::max<int64_t>(sum, 1), 256);
++            }
++            if (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(xchg, err)) {
                  std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
-@@ -3811,6 +3863,8 @@ int main(int argc, char** argv) {
+                 return 1;
+             }
+@@ -3811,6 +3885,8 @@ int main(int argc, char** argv) {
              int32_t first_now = -1;        // where its buffers are laid out now
              int64_t lent_chunk = 0;
              std::vector<std::pair<int32_t, int32_t>> lent;
@@ -1141,7 +1284,7 @@ index 1a2f203..8531fb4 100644
          };
          auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
              const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, c);
-@@ -3884,8 +3938,42 @@ int main(int argc, char** argv) {
+@@ -3884,8 +3960,42 @@ int main(int argc, char** argv) {
                      std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens so its buffers fit in "
                                           "every expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
                  o.prefill_chunk = chunk;
@@ -1185,7 +1328,7 @@ index 1a2f203..8531fb4 100644
                      p.first_now = p.first;
                  }
                  // #340: a split stage whose card still has room for the chunk's buffers (its cache already holds
-@@ -3903,7 +3991,7 @@ int main(int argc, char** argv) {
+@@ -3903,7 +4013,7 @@ int main(int argc, char** argv) {
                          const strata::core::OnDevice on(p.dev);
                          size_t fb = 0, tb = 0;
                          if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
@@ -1194,7 +1337,7 @@ index 1a2f203..8531fb4 100644
                          if ((uint64_t) fb >= need + (3ull << 29)) {
                              std::fprintf(stderr, "strata serve:   CUDA%d keeps its own prompt buffers (%.2f GiB of "
                                                   "%.2f GiB free): no loan\n", p.dev < 0 ? 0 : p.dev,
-@@ -3953,6 +4041,26 @@ int main(int argc, char** argv) {
+@@ -3953,6 +4063,26 @@ int main(int argc, char** argv) {
          // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned (#253) a
          // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
          // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
@@ -1221,7 +1364,7 @@ index 1a2f203..8531fb4 100644
          auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
              for (size_t i = 0; i < stages.size(); ++i) {
                  GpuStage& st = *stages[i];
-@@ -3965,7 +4073,7 @@ int main(int argc, char** argv) {
+@@ -3965,7 +4095,7 @@ int main(int argc, char** argv) {
                      sb = st.cache.device_slot(pf_parts[i + 1].first);
                      sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                  }
@@ -1230,7 +1373,7 @@ index 1a2f203..8531fb4 100644
                                  err, sb, sbb)) {
                      err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
                      return err.find("do not fit") != std::string::npos ? 2 : 1;
-@@ -3990,7 +4098,10 @@ int main(int argc, char** argv) {
+@@ -3990,7 +4120,10 @@ int main(int argc, char** argv) {
                      const strata::core::OnDevice on(dev);
                      size_t fb = 0, tb = 0;
                      cudaMemGetInfo(&fb, &tb);
@@ -1242,7 +1385,7 @@ index 1a2f203..8531fb4 100644
                      if (need + kHeadroom > (int64_t) fb) {
                          dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
                          return false;
-@@ -4000,6 +4111,7 @@ int main(int argc, char** argv) {
+@@ -4000,6 +4133,7 @@ int main(int argc, char** argv) {
              };
              int dev = 0;
              int64_t need = 0, fb = 0;
@@ -1250,7 +1393,7 @@ index 1a2f203..8531fb4 100644
              if (!own_fits(o.prefill_chunk, dev, need, fb)) {
                  int64_t c = 0;
                  for (const int64_t s : kStepChunks) {
-@@ -4012,12 +4124,30 @@ int main(int argc, char** argv) {
+@@ -4012,12 +4146,30 @@ int main(int argc, char** argv) {
                                           "%lld MiB free: %lld-token chunks\n", (long long) o.prefill_chunk,
                                   (long long) (need >> 20), dev, (long long) (fb >> 20), (long long) c);
                      o.prefill_chunk = c;
@@ -1281,7 +1424,7 @@ index 1a2f203..8531fb4 100644
              int64_t next = 0;
              for (const int64_t c : kStepChunks)
                  if (c < o.prefill_chunk) { next = c; break; }
-@@ -4033,6 +4163,7 @@ int main(int argc, char** argv) {
+@@ -4033,6 +4185,7 @@ int main(int argc, char** argv) {
                  sp.reset();
                  (void) cudaGetLastError();
                  o.prefill_chunk = next;
@@ -1289,7 +1432,7 @@ index 1a2f203..8531fb4 100644
                  if (any_loan) {                  // smaller loans for the smaller chunk
                      for (PfPart& p : pf_parts)
                          if (p.first >= 0) {
-@@ -4426,9 +4557,106 @@ int main(int argc, char** argv) {
+@@ -4426,9 +4579,107 @@ int main(int argc, char** argv) {
              pending.clear();
              res_upload();
          };
@@ -1391,17 +1534,32 @@ index 1a2f203..8531fb4 100644
 +            return true;
 +        };
          // the VRAM tier follows the conversation (the same rule as the speculative loop below)
++        int64_t adapt_done[8] = {};   // V100 fork: swaps started per card since the start (the request log)
          auto adapt = [&]() -> bool {
 -            if (!pending.empty()) return true;   // the previous swaps are still in flight
 +            if (!pending.empty() || ajob.state != 0) return true;   // the previous swaps are still in flight
              struct Swap { float gain; int32_t layer, in, out; };
              std::vector<Swap> swaps;
              std::vector<std::pair<float, int32_t>> cand, vict;
-@@ -4453,7 +4681,32 @@ int main(int argc, char** argv) {
+@@ -4452,8 +4703,45 @@ int main(int argc, char** argv) {
+                 }
              }
              std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
-             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+-            if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
 -            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
++            if (multi_gpu && !o.adapt_stage_swaps.empty()) {   // V100 fork: each card's own budget, best gains first
++                std::vector<int> left(o.adapt_stage_swaps);
++                size_t kept = 0;
++                for (const Swap& w : swaps) {
++                    const size_t st = (size_t) stage_of(w.layer);
++                    int& n = st < left.size() ? left[st] : left.back();   // cards past the list: the last budget
++                    if (n <= 0) continue;
++                    --n;
++                    swaps[kept++] = w;
++                }
++                swaps.resize(kept);
++            } else if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
++            for (const Swap& w : swaps) ++adapt_done[std::min(7, multi_gpu ? stage_of(w.layer) : 0)];
 +            if (!adapt_sync) {   // V100 fork: the job above (the worker copies; this only picks and starts it)
 +                ajob.swaps.clear();
 +                int64_t q = 0;
@@ -1431,7 +1589,7 @@ index 1a2f203..8531fb4 100644
              bool main_live = false;
              for (const Swap& s : swaps) {
                  const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
-@@ -5111,17 +5364,21 @@ int main(int argc, char** argv) {
+@@ -5111,17 +5399,21 @@ int main(int argc, char** argv) {
                  const auto t_ln = Clock::now();
                  // what this segment needs, capped by the configured chunk: a request lends only what its own
                  // prompt needs, so a large chunk costs a short prompt nothing
@@ -1458,7 +1616,7 @@ index 1a2f203..8531fb4 100644
                      if (!p.lent.empty()) {
                          if (want <= p.lent_chunk) continue;            // its current loan already covers this
                          // ONLY this participant's loan goes back: `refill` would return the other participants'
-@@ -5151,11 +5408,15 @@ int main(int argc, char** argv) {
+@@ -5151,11 +5443,15 @@ int main(int argc, char** argv) {
                      int64_t n_lent = 0;
                      for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
                      std::fprintf(stderr, "strata trace: lent %lld slots for %lld tokens in %.1f ms\n", (long long) n_lent,
@@ -1475,7 +1633,7 @@ index 1a2f203..8531fb4 100644
              apply_pending(true);
              // per-request sampling for the verify window's head (greedy when temperature is absent)
              strata::kernels::SamplerParams req_sp;
-@@ -5319,6 +5580,10 @@ int main(int argc, char** argv) {
+@@ -5319,6 +5615,10 @@ int main(int argc, char** argv) {
                  drive.d.layers = 0;
                  drive.d.experts = 0;
                  drive.d.failed = false;
@@ -1486,10 +1644,17 @@ index 1a2f203..8531fb4 100644
                  apply_pending(false);
                  if (hist_n > 0) {
                      // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
-@@ -5558,6 +5823,37 @@ int main(int argc, char** argv) {
+@@ -5558,6 +5858,44 @@ int main(int argc, char** argv) {
                               100.0 * (double) req_hits / (double) req_look,
                               (long long) req_hits, (long long) req_look);
              }
++            if (!drive.d.usage.empty()) {
++                std::string per;
++                for (int st = 0; st < (multi_gpu ? 1 + (int) stages.size() : 1) && st < 8; ++st)
++                    per += (st ? ", CUDA" : "CUDA") + std::to_string(st > 0 ? stages[(size_t) st - 1]->dev : 0) + " " +
++                           std::to_string((long long) adapt_done[st]);
++                std::fprintf(stderr, "strata serve: adaptive swaps since the start: %s\n", per.c_str());
++            }
 +            // V100 fork: the PLE rows' reads (layer 1's n-gram table on the SSD; cumulative since the start) - each
 +            // window reads its tokens' rows before it launches, so their latency is decode time
 +            if (ss.ple.table != nullptr)
@@ -1961,12 +2126,279 @@ index 0000000..43e0977
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+diff --git a/tools/v100_cachesim.py b/tools/v100_cachesim.py
+new file mode 100644
+index 0000000..6885560
+--- /dev/null
++++ b/tools/v100_cachesim.py
+@@ -0,0 +1,261 @@
++"""V100 fork: replay your recorded decode routing against the GPU expert caches - NO GPU USED (CPU only, a few minutes).
++
++Every workload run (tools/v100_workload.py) leaves runs\\workload-<date-time>\\routing.bin: the experts each layer
++routed to, token by token, in order.  This tool replays those traces through a model of the engine's expert caches
++(which experts each card holds at the start - from an expert profile - and the adaptive tier: every 4th verify window,
++the most-routed missing experts of a layer swap in for its least-routed resident ones, usage decayed by 0.7, at most
++--adapt-swaps of them, or a budget per card) and reports the share of expert lookups the GPUs answer.  The rest go
++to the CPU, which is the largest part of a decode window here.
++
++  1. the model against the engine: the replayed hit rate next to the one the engine logged in that run;
++  2. an expert profile built from your largest run's trace against the shipped one, scored on the OTHER runs (a
++     ranking that only fits the conversation it was made from is no use);
++  3. the adaptive tier's swap budget: shared (--adapt-swaps 32, the config now) against a budget per card
++     (--adapt-stage-swaps CUDA0,CUDA1);
++  4. what more VRAM for the 4070 Super's cache would be worth.
++
++    .venv\\Scripts\\python tools\\v100_cachesim.py                    (what v100\\16_expert_cache.bat runs first)
++    ... --write-profile      also write data\\expert-profile-workload.bin (from all runs) when it scores better
++"""
++from __future__ import annotations
++
++import argparse
++import re
++import struct
++import time
++from pathlib import Path
++
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[1]
++NL, NE, K = 48, 512, 10
++REC = 2 + 2 * K                       # layer, k, k ids, k weights (int32 / float32)
++
++
++class Log:
++    def __init__(self, path):
++        self.f = open(path, "a", encoding="utf-8")
++
++    def __call__(self, *parts):
++        line = " ".join(str(p) for p in parts)
++        print(line, flush=True)
++        self.f.write(line + "\n")
++        self.f.flush()
++
++
++def read_profile(path):
++    b = Path(path).read_bytes()
++    if b[:4] != b"STRP":
++        raise SystemExit(f"{path}: not a Strata profile")
++    _, nl, ne, _, n = struct.unpack_from("<5I", b, 4)
++    if (nl, ne) != (NL, NE):
++        raise SystemExit(f"{path}: {nl}x{ne}")
++    return [struct.unpack_from("<HH", b, 24 + 4 * i) for i in range(n)]
++
++
++def write_profile(path, ranked):
++    table = np.full((NL, NE), -1, np.int32)
++    for slot, (l, e) in enumerate(ranked):
++        table[l, e] = slot
++    with open(path, "wb") as f:
++        f.write(b"STRP" + struct.pack("<5I", 1, NL, NE, len(ranked), len(ranked)))
++        for l, e in ranked:
++            f.write(struct.pack("<HH", l, e))
++        f.write(table.astype("<i4").tobytes())
++
++
++class Trace:
++    def __init__(self, path):
++        r = np.fromfile(path, dtype=np.int32)
++        n = len(r) // REC
++        r = r[: n * REC].reshape(n, REC)
++        if n and not (r[:, 1] == K).all():
++            raise SystemExit(f"{path}: records with k != {K}")
++        self.L = r[:, 0].copy()
++        self.ids = r[:, 2:2 + K].copy()
++        self.w = np.r_[0, np.cumsum(self.L[1:] < self.L[:-1])] if n else np.zeros(0, np.int64)
++        self.windows = int(self.w[-1]) + 1 if n else 0
++        self.tokens = n // NL
++
++    def freq(self):
++        f = np.zeros((NL, NE), np.int64)
++        np.add.at(f, (np.repeat(self.L, K), self.ids.ravel()), 1)
++        return f
++
++
++def initial(profile, cards):
++    res = np.zeros((NL, NE), bool)
++    for lo, hi, n in cards:
++        k = 0
++        for l, e in profile:
++            if k >= n:
++                break
++            if lo <= l < hi:
++                res[l, e] = True
++                k += 1
++    return res
++
++
++def simulate(t: Trace, res0, cards, budget, every=4, decay=0.7):
++    """budget: an int (shared, as --adapt-swaps) or a tuple per card (--adapt-stage-swaps); 0 = no swaps"""
++    res = res0.copy()
++    usage = np.zeros((NL, NE), np.float32)
++    starts = np.searchsorted(t.w, np.arange(t.windows))
++    ends = np.r_[starts[1:], len(t.w)]
++    card_of = np.zeros(NL, np.int64)
++    for c, (lo, hi, _) in enumerate(cards):
++        card_of[lo:hi] = c
++    hits = np.zeros(len(cards))
++    looks = np.zeros(len(cards))
++    nswap = 0
++    for i in range(t.windows):
++        a, b = starts[i], ends[i]
++        ll = np.repeat(t.L[a:b], K)
++        ee = t.ids[a:b].ravel()
++        h = res[ll, ee]
++        cl = card_of[ll]
++        hits += np.bincount(cl, weights=h, minlength=len(cards))
++        looks += np.bincount(cl, minlength=len(cards))
++        if budget == 0 or budget == (0,) * len(cards):
++            continue
++        np.add.at(usage, (ll, ee), 1.0)
++        if (i + 1) % every:
++            continue
++        cand = np.where(~res & (usage >= 2.0), usage, -np.inf)
++        vict = np.where(res, usage, np.inf)
++        W = 192
++        ci = np.argsort(-cand, axis=1, kind="stable")[:, :W]
++        cs = np.take_along_axis(cand, ci, 1)
++        vi = np.argsort(vict, axis=1, kind="stable")[:, :W]
++        vs = np.take_along_axis(vict, vi, 1)
++        ok = np.cumprod(np.isfinite(cs) & np.isfinite(vs) & (cs >= vs + 1.5), axis=1).astype(bool)
++        lay, pos = np.nonzero(ok)
++        if len(lay):
++            gain = (cs - vs)[lay, pos]
++            order = np.argsort(-gain, kind="stable")
++            if isinstance(budget, int):
++                order = order[:budget]
++            else:
++                left = list(budget)
++                keep = []
++                for j in order:
++                    c = card_of[lay[j]]
++                    if left[c] > 0:
++                        left[c] -= 1
++                        keep.append(j)
++                order = keep
++            for j in order:
++                l, p = lay[j], pos[j]
++                res[l, ci[l, p]] = True
++                res[l, vi[l, p]] = False
++            nswap += len(order)
++        usage *= decay
++    tot = hits.sum() / max(1, looks.sum())
++    per = [hits[c] / max(1, looks[c]) for c in range(len(cards))]
++    return tot, per, nswap / max(1, t.windows // every)
++
++
++def rank_by(freq, tiebreak):
++    tb = np.full((NL, NE), NL * NE, np.int64)
++    for r, (l, e) in enumerate(tiebreak):
++        tb[l, e] = r
++    order = np.lexsort((tb.ravel(), -freq.ravel()))
++    return [(int(i // NE), int(i % NE)) for i in order]
++
++
++def engine_facts(log: Path):
++    """(cards, logged decode hit rate) from a run's engine.log"""
++    if not log.exists():
++        return None, None
++    txt = log.read_text(encoding="utf-8", errors="replace")
++    c0 = re.search(r"pre-filled (\d+) of (\d+) slots", txt)
++    c1 = re.search(r"layer split: CUDA1 runs layers (\d+)-(\d+), expert cache (\d+) slots", txt)
++    cards = None
++    if c0 and c1:
++        k = int(c1.group(1))
++        cards = [(0, k, int(c0.group(2))), (k, NL, int(c1.group(3)))]
++    h = l = 0
++    for m in re.finditer(r"decode expert cache hit rate: [\d.]+% \((\d+) hits / (\d+) lookups\)", txt):
++        h += int(m.group(1))
++        l += int(m.group(2))
++    return cards, (h / l if l else None)
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--runs", default=str(ROOT / "runs"))
++    ap.add_argument("--profile", default=str(ROOT / "data" / "expert-profile.bin"))
++    ap.add_argument("--log", default=str(ROOT / "v100_cachesim.log"))
++    ap.add_argument("--write-profile", action="store_true")
++    a = ap.parse_args()
++    log = Log(a.log)
++    log(f"==== v100_cachesim {time.strftime('%Y-%m-%d %H:%M:%S')}")
++    base = read_profile(a.profile)
++    runs = []
++    for d in sorted(Path(a.runs).glob("workload-*")):
++        rb = d / "routing.bin"
++        if not rb.exists() or rb.stat().st_size < REC * 4 * NL * 100:
++            continue
++        t = Trace(rb)
++        cards, eng = engine_facts(d / "engine.log")
++        runs.append((d.name, t, cards, eng))
++        log(f"  {d.name}: {t.tokens} tokens in {t.windows} verify windows ({t.tokens / max(1, t.windows):.2f} per window)"
++            f"; caches {cards}; engine's decode hit rate {'%.1f%%' % (100 * eng) if eng else '-'}")
++    if not runs:
++        log("  no runs\\workload-*\\routing.bin found")
++        return 1
++    cards = next((c for _, _, c, _ in runs if c), [(0, 20, 1736), (20, 48, 8334)])
++    log(f"  the caches modelled: " + ", ".join(f"CUDA{i} layers {lo}-{hi - 1}: {n} slots ({100 * n / ((hi - lo) * NE):.0f}% "
++                                              f"of their experts)" for i, (lo, hi, n) in enumerate(cards)))
++    res_base = initial(base, cards)
++
++    log("\n1. the model against the engine (the shipped profile, --adapt-swaps 32 shared)")
++    for name, t, c, eng in runs:
++        tot, per, _ = simulate(t, initial(base, c or cards), c or cards, 32)
++        log(f"  {name}: replayed {100 * tot:.1f}% (CUDA0's layers {100 * per[0]:.1f}%, CUDA1's {100 * per[1]:.1f}%); "
++            f"engine {'%.1f%%' % (100 * eng) if eng else '-'}")
++
++    log("\n2. an expert profile from your own routing, scored on the runs it was NOT made from")
++    big = max(runs, key=lambda r: r[1].tokens)
++    trained = rank_by(big[1].freq(), base)
++    res_tr = initial(trained, cards)
++    gains = []
++    for name, t, _, _ in runs:
++        tag = "(made from this run)" if name == big[0] else "(held out)"
++        for bud in (32, (96, 32)):
++            b0 = simulate(t, res_base, cards, bud)[0]
++            b1 = simulate(t, res_tr, cards, bud)[0]
++            if name != big[0]:
++                gains.append(b1 - b0)
++            log(f"  {name} {tag}, swaps {bud}: shipped {100 * b0:.1f}%, from {big[0]} {100 * b1:.1f}% ({100 * (b1 - b0):+.1f})")
++    held = 100 * float(np.mean(gains)) if gains else None
++    log(f"  => held-out change from the trained profile: {'%+.2f points' % held if held is not None else 'no held-out run'}")
++
++    log("\n3. the adaptive swap budget (per 4-window round)")
++    for name, t, _, _ in runs:
++        for bud in (32, (32, 32), (64, 32), (96, 32), (128, 32), (160, 32), (96, 16)):
++            tot, per, ns = simulate(t, res_base, cards, bud)
++            log(f"  {name} {str(bud):>10}: {100 * tot:.1f}% (CUDA0's layers {100 * per[0]:.1f}%, CUDA1's "
++                f"{100 * per[1]:.1f}%), {ns:.0f} swaps per round")
++
++    log("\n4. more slots for CUDA0 (each ~2.9 MB), --adapt-stage-swaps 96,32")
++    t = big[1]
++    for extra in (0, 350, 700, 1050):
++        c2 = [(cards[0][0], cards[0][1], cards[0][2] + extra), cards[1]]
++        tot, per, _ = simulate(t, initial(base, c2), c2, (96, 32))
++        log(f"  {big[0]}: CUDA0 {c2[0][2]} slots (+{extra * 2.92 / 1024:.1f} GiB): {100 * tot:.1f}% "
++            f"(CUDA0's layers {100 * per[0]:.1f}%)")
++
++    if a.write_profile:
++        if held is not None and held >= 0.5:
++            f = sum((r[1].freq() for r in runs), np.zeros((NL, NE), np.int64))
++            out = ROOT / "data" / "expert-profile-workload.bin"
++            write_profile(out, rank_by(f, base))
++            log(f"\n  wrote {out} (all runs' routing; point --expert-profile at it to use it)")
++        else:
++            log("\n  no profile written: the trained one does not score better on runs it was not made from")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
 diff --git a/tools/v100_decodebench.py b/tools/v100_decodebench.py
 new file mode 100644
-index 0000000..991de8c
+index 0000000..859db0d
 --- /dev/null
 +++ b/tools/v100_decodebench.py
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,293 @@
 +"""V100 fork: where the decode (writing) time goes on the 4070 Super + V100 split, and what changes it.
 +
 +Every variant restarts the engine with one change against the config (strata-unsloth-ud-q4_k_xl.json, 256K context)
@@ -2116,9 +2548,21 @@ index 0000000..991de8c
 +                  {"--ple-gguf": None}, {}, None),
 +    "ple_shard_end": ("the PLE table from shard 2 again, last", {"--ple-gguf": None}, {}, None),
 +})
++# round 8 (2026-10-03): the adaptive tier's swap budget per card (--adapt-stage-swaps CUDA0,CUDA1).  Replaying the
++# workload runs' routing (tools/v100_cachesim.py): the 4070 Super's layers answer ~55% of their lookups on the GPU,
++# the V100's ~94%, and the shared budget of 32 gives the 4070 Super only ~17 swaps a round; a budget per card
++# replayed 77.0 -> 80.0% (96,32).  The 4070 Super's swaps cross its x16 link; the V100 keeps its 32.
++VARIANTS.update({
++    "stage64_32": ("swap budget per card: 64 for the 4070S, 32 for the V100 (--adapt-stage-swaps 64,32)",
++                   {"--adapt-stage-swaps": "64,32"}, {}, None),
++    "stage96_32": ("swap budget per card: 96 for the 4070S, 32 for the V100", {"--adapt-stage-swaps": "96,32"}, {}, None),
++    "stage160_32": ("swap budget per card: 160 for the 4070S, 32 for the V100", {"--adapt-stage-swaps": "160,32"}, {},
++                    None),
++    "stage96_16": ("swap budget per card: 96 for the 4070S, 16 for the V100", {"--adapt-stage-swaps": "96,16"}, {}, None),
++})
 +ENGINE_LINE_KEYS = ("ple io", "page-locked", "locked resident", "decode timing", "decode GPU stages", "strata serve: stage ", "hit rate", "layer split auto",
 +                    "expert cache ", "layer split: CUDA", "strata serve: prompt ", "pcie_frac", "PCIe probe",
-+                    "resident RAM mode", "ERROR", "error", "failed")
++                    "resident RAM mode", "adaptive", "ERROR", "error", "failed")
 +
 +
 +def chat(tok, text):
@@ -3375,10 +3819,10 @@ index 0000000..d46d538
 +    sys.exit(main())
 diff --git a/tools/v100_setup.py b/tools/v100_setup.py
 new file mode 100644
-index 0000000..e16d5f1
+index 0000000..8a44ac3
 --- /dev/null
 +++ b/tools/v100_setup.py
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,196 @@
 +"""V100 fork: set up UD-Q4_K_XL on an RTX 4070 Super + Tesla V100 PC, and build the GPU test programs.
 +
 +Uses NO GPU: it only asks nvidia-smi which cards are there, then runs setup (download/pack if needed, compile the
@@ -3465,6 +3909,15 @@ index 0000000..e16d5f1
 +        order = f"{ada[0]['index']},{volta[0]['index']}"
 +    log(f"  GPU order for the layer split: {order} (the first one is CUDA0)")
 +    py = sys.executable
++    # your own settings in the config (a "sampling" block, "aliases", "max_tokens") - setup writes the config anew,
++    # so they are put back after it
++    keep = {}
++    try:
++        import json
++        old = json.loads((ROOT / "strata-unsloth-ud-q4_k_xl.json").read_text(encoding="utf-8-sig"))
++        keep = {k: old[k] for k in ("sampling", "aliases", "max_tokens") if k in old}
++    except (OSError, ValueError):
++        pass
 +    if not a.skip_setup:
 +        cmd = [py, str(ROOT / "setup.py"), "--setup", "--build", "--yes", "--no-start", "--family", "unsloth",
 +               "--model", "UD-Q4_K_XL", "--gpus", order, "--context", str(a.context), "--vision", "no",
@@ -3528,12 +3981,21 @@ index 0000000..e16d5f1
 +        # v100_decodebench3/4 (2026-10-03): --spec-min-p 0.7 was a little ahead in every round; layers 0-19 on the
 +        # 4070 Super decode as fast as 0-16 (17-22 are within the noise) and read prompts ~7% faster (the V100
 +        # streams fewer layers' experts)
++        # v100_workload (2026-10-03, a real hour at 30-213K context): new text of 65-768 tokens read batched took 3.6-10 s
++        # (the V100 streams every routed expert it lacks over its x4 link); the decode windows read ~13 ms a token,
++        # which is faster up to ~1000 tokens: --short-read 768 (was 64) saves ~165 s an hour of that work
 +        for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11"), ("--prefill", "auto:32768"),
-+                          ("--adapt-swaps", "32"), ("--spec-min-p", "0.7")):
++                          ("--adapt-swaps", "32"), ("--spec-min-p", "0.7"),
++                          ("--short-read", "768")):
 +            if flag in c["args"]:
 +                c["args"][c["args"].index(flag) + 1] = val
 +            else:
 +                c["args"] += [flag, val]
++        # clients that ask for "the rest of the context" from their own token estimate (pi after a compaction asked
++        # 4K over): fit max_tokens to the room left instead of rejecting the request with a 400
++        c["fit_max_tokens"] = True
++        for k, v in keep.items():
++            c.setdefault(k, v)
 +        if isinstance(c.get("gpu"), list) and len(c["gpu"]) == 2:
 +            c["layer_split"] = "20"
 +        # the PLE table in a file of its own (tools/v100_ple_split.py), when it has been made: setup's config
@@ -3549,7 +4011,7 @@ index 0000000..e16d5f1
 +                log(f"  the PLE table from its own file: {own[0].name}")
 +        cfg.write_text(json.dumps(c, indent=1), encoding="utf-8")
 +        log("  tuned for this PC: --pool-affinity auto --pool-workers 11 --prefill auto:32768 --adapt-swaps 32 "
-+            "--spec-min-p 0.7, layer_split 20")
++            "--spec-min-p 0.7 --short-read 768, layer_split 20, fit_max_tokens")
 +    if cfg.exists():
 +        log(cfg.read_text(encoding="utf-8"))
 +    return rc
@@ -3902,6 +4364,35 @@ index 0000000..2cefe6b
 +setlocal
 +cd /d "%~dp0.."
 +".venv\Scripts\python.exe" tools\v100_workload.py %*
++pause
+diff --git a/v100/16_expert_cache.bat b/v100/16_expert_cache.bat
+new file mode 100644
+index 0000000..dbeb159
+--- /dev/null
++++ b/v100/16_expert_cache.bat
+@@ -0,0 +1,23 @@
++@echo off
++rem V100 fork, step 16 - the expert caches: your recorded routing replayed, then the adaptive swaps with a budget per card.
++rem   Part 1 (no GPU): compiles the changed engine file (a few minutes; log v100_setup.log), then replays the routing
++rem   of your workload runs (runs\workload-*\routing.bin) through a model of the expert caches (5-10 minutes, CPU
++rem   only).  Log: v100_cachesim.log.
++rem   Part 2 (USES BOTH GPUs, ~30-35 minutes, nothing compiled): six engine runs - the config, the swap budget per card
++rem   at 64/32, 96/32, 160/32 and 96/16 (4070 Super/V100), the config again.  Log: v100_decodebench8.log (+ .json).
++setlocal
++cd /d "%~dp0.."
++".venv\Scripts\python.exe" tools\v100_setup.py --context 262144
++if errorlevel 1 (
++  echo Setup or the build failed - send v100_setup.log back for review.
++  pause
++  exit /b 1
++)
++".venv\Scripts\python.exe" tools\v100_cachesim.py
++echo.
++echo Part 1 is done. Part 2 uses both GPUs for about 30-35 minutes. Stop the server and any other GPU program first.
++pause
++".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench8.log --variants baseline,stage64_32,stage96_32,stage160_32,stage96_16,baseline_end %*
++echo.
++echo Done. Send v100_cachesim.log and v100_decodebench8.log back for review.
 +pause
 diff --git a/v100/1_setup_and_build.bat b/v100/1_setup_and_build.bat
 new file mode 100644

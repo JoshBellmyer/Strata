@@ -1,0 +1,188 @@
+[
+ {
+  "variant": "baseline",
+  "what": "the config as it is (4070S layers 0-16, V100 the rest)",
+  "load_s": 88.6,
+  "short_tok_s": 59.75,
+  "short_all": [
+   62.41,
+   53.84,
+   55.57,
+   67.99,
+   57.71,
+   61.8
+  ],
+  "long_tok_s": 53.95,
+  "long": [
+   {
+    "tok_s": 51.94,
+    "n": 300,
+    "hit": 76.3843896713615,
+    "acc": 165,
+    "off": 220
+   },
+   {
+    "tok_s": 55.95,
+    "n": 300,
+    "hit": 81.68726459510358,
+    "acc": 160,
+    "off": 213
+   }
+  ]
+ },
+ {
+  "variant": "stage64_32",
+  "what": "swap budget per card: 64 for the 4070S, 32 for the V100 (--adapt-stage-swaps 64,32)",
+  "load_s": 107.8,
+  "short_tok_s": 57.61,
+  "short_all": [
+   64.68,
+   52.74,
+   58.55,
+   64.83,
+   55.75,
+   56.68
+  ],
+  "long_tok_s": 53.65,
+  "long": [
+   {
+    "tok_s": 50.44,
+    "n": 300,
+    "hit": 75.04190962099125,
+    "acc": 163,
+    "off": 206
+   },
+   {
+    "tok_s": 56.86,
+    "n": 300,
+    "hit": 81.37863955823293,
+    "acc": 169,
+    "off": 200
+   }
+  ]
+ },
+ {
+  "variant": "stage96_32",
+  "what": "swap budget per card: 96 for the 4070S, 32 for the V100",
+  "load_s": 110.9,
+  "short_tok_s": 58.96,
+  "short_all": [
+   64.38,
+   51.83,
+   57.59,
+   67.33,
+   57.38,
+   60.33
+  ],
+  "long_tok_s": 52.45,
+  "long": [
+   {
+    "tok_s": 50.64,
+    "n": 300,
+    "hit": 76.03927203065135,
+    "acc": 164,
+    "off": 211
+   },
+   {
+    "tok_s": 54.26,
+    "n": 300,
+    "hit": 82.85136815920399,
+    "acc": 156,
+    "off": 188
+   }
+  ]
+ },
+ {
+  "variant": "stage160_32",
+  "what": "swap budget per card: 160 for the 4070S, 32 for the V100",
+  "load_s": 106.6,
+  "short_tok_s": 58.48,
+  "short_all": [
+   64.62,
+   52.19,
+   56.49,
+   69.1,
+   57.06,
+   59.89
+  ],
+  "long_tok_s": 51.84,
+  "long": [
+   {
+    "tok_s": 48.77,
+    "n": 300,
+    "hit": 77.30597527472527,
+    "acc": 155,
+    "off": 218
+   },
+   {
+    "tok_s": 54.91,
+    "n": 300,
+    "hit": 81.95896464646465,
+    "acc": 159,
+    "off": 189
+   }
+  ]
+ },
+ {
+  "variant": "stage96_16",
+  "what": "swap budget per card: 96 for the 4070S, 16 for the V100",
+  "load_s": 108.1,
+  "short_tok_s": 58.07,
+  "short_all": [
+   65.58,
+   51.94,
+   55.62,
+   68.98,
+   57.5,
+   58.64
+  ],
+  "long_tok_s": 53.32,
+  "long": [
+   {
+    "tok_s": 50.57,
+    "n": 300,
+    "hit": 77.34550561797752,
+    "acc": 153,
+    "off": 208
+   },
+   {
+    "tok_s": 56.07,
+    "n": 300,
+    "hit": 80.21755162241888,
+    "acc": 166,
+    "off": 205
+   }
+  ]
+ },
+ {
+  "variant": "baseline_end",
+  "what": "the config again, last (how much the numbers drift over the run)",
+  "load_s": 105.5,
+  "short_tok_s": 58.33,
+  "short_all": [
+   60.64,
+   54.8,
+   54.32,
+   67.95,
+   57.31,
+   59.34
+  ],
+  "long_tok_s": 54.58,
+  "long": [
+   {
+    "tok_s": 53.25,
+    "n": 300,
+    "hit": 74.83565493646138,
+    "acc": 159,
+    "off": 200
+   },
+   {
+    "tok_s": 55.91,
+    "n": 300,
+    "hit": 80.42213313896987,
+    "acc": 158,
+    "off": 201
+   }
+  ]
+ }
+]

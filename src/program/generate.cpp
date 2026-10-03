@@ -403,6 +403,11 @@ struct Options {
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
+    /// V100 fork: --adapt-stage-swaps N0,N1,..: the swap budget of each card of a layer split (CUDA0's layers first),
+    /// in place of the one --adapt-swaps budget the cards shared.  The 4070 Super's layers miss the most (its cache
+    /// holds ~17% of their experts, the V100's ~58%) and its swaps cross a x16 link; the V100's cross a x4 link that
+    /// decode also uses.  Empty: --adapt-swaps for all of them together, as before.
+    std::vector<int> adapt_stage_swaps;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
@@ -524,6 +529,8 @@ void usage() {
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
                  "                       of the batched prompt path (default 64, 0 = off)\n"
+                 "  --adapt-stage-swaps N0,N1  --serve, layer split: each card's adaptive swap budget per round (CUDA0's\n"
+                 "                       layers first) instead of --adapt-swaps shared by all of them\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
@@ -1230,6 +1237,16 @@ int main(int argc, char** argv) {
             o.stop_eos = true;
         }
         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
+        else if (a == "--adapt-stage-swaps") {
+            std::vector<int64_t> v;
+            std::string e;
+            if (!parse_i64_list(next("--adapt-stage-swaps"), v, e)) {
+                std::fprintf(stderr, "--adapt-stage-swaps: %s\n", e.c_str());
+                return 2;
+            }
+            o.adapt_stage_swaps.clear();
+            for (const int64_t x : v) o.adapt_stage_swaps.push_back((int) std::max<int64_t>(0, std::min<int64_t>(x, 512)));
+        }
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
@@ -3811,8 +3828,13 @@ int main(int argc, char** argv) {
         }
         if (src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from, o.resident_headroom,
                                      o.resident_budget, multi_gpu ? &profile_all : &profile)) {
-            if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
-                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
+            int64_t xchg = std::min<int64_t>(o.adapt_swaps, 96);
+            if (multi_gpu && !o.adapt_stage_swaps.empty()) {   // V100 fork: every card's swaps can be exchanges
+                int64_t sum = 0;
+                for (const int x : o.adapt_stage_swaps) sum += x;
+                xchg = std::min<int64_t>(std::max<int64_t>(sum, 1), 256);
+            }
+            if (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(xchg, err)) {
                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
                 return 1;
             }
@@ -4655,6 +4677,7 @@ int main(int argc, char** argv) {
             return true;
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+        int64_t adapt_done[8] = {};   // V100 fork: swaps started per card since the start (the request log)
         auto adapt = [&]() -> bool {
             if (!pending.empty() || ajob.state != 0) return true;   // the previous swaps are still in flight
             struct Swap { float gain; int32_t layer, in, out; };
@@ -4680,7 +4703,19 @@ int main(int argc, char** argv) {
                 }
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
-            if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            if (multi_gpu && !o.adapt_stage_swaps.empty()) {   // V100 fork: each card's own budget, best gains first
+                std::vector<int> left(o.adapt_stage_swaps);
+                size_t kept = 0;
+                for (const Swap& w : swaps) {
+                    const size_t st = (size_t) stage_of(w.layer);
+                    int& n = st < left.size() ? left[st] : left.back();   // cards past the list: the last budget
+                    if (n <= 0) continue;
+                    --n;
+                    swaps[kept++] = w;
+                }
+                swaps.resize(kept);
+            } else if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            for (const Swap& w : swaps) ++adapt_done[std::min(7, multi_gpu ? stage_of(w.layer) : 0)];
             if (!adapt_sync) {   // V100 fork: the job above (the worker copies; this only picks and starts it)
                 ajob.swaps.clear();
                 int64_t q = 0;
@@ -5822,6 +5857,13 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)\n",
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look);
+            }
+            if (!drive.d.usage.empty()) {
+                std::string per;
+                for (int st = 0; st < (multi_gpu ? 1 + (int) stages.size() : 1) && st < 8; ++st)
+                    per += (st ? ", CUDA" : "CUDA") + std::to_string(st > 0 ? stages[(size_t) st - 1]->dev : 0) + " " +
+                           std::to_string((long long) adapt_done[st]);
+                std::fprintf(stderr, "strata serve: adaptive swaps since the start: %s\n", per.c_str());
             }
             // V100 fork: the PLE rows' reads (layer 1's n-gram table on the SSD; cumulative since the start) - each
             // window reads its tokens' rows before it launches, so their latency is decode time
