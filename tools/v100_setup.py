@@ -157,6 +157,9 @@ def main() -> int:
                 c["args"][c["args"].index(flag) + 1] = val
             else:
                 c["args"] += [flag, val]
+        # clients that ask for "the rest of the context" from their own token estimate (pi after a compaction asked
+        # 4K over): fit max_tokens to the room left instead of rejecting the request with a 400
+        c["fit_max_tokens"] = True
         if isinstance(c.get("gpu"), list) and len(c["gpu"]) == 2:
             c["layer_split"] = "20"
         # the PLE table in a file of its own (tools/v100_ple_split.py), when it has been made: setup's config
@@ -172,7 +175,7 @@ def main() -> int:
                 log(f"  the PLE table from its own file: {own[0].name}")
         cfg.write_text(json.dumps(c, indent=1), encoding="utf-8")
         log("  tuned for this PC: --pool-affinity auto --pool-workers 11 --prefill auto:32768 --adapt-swaps 32 "
-            "--spec-min-p 0.7 --short-read 768, layer_split 20")
+            "--spec-min-p 0.7 --short-read 768, layer_split 20, fit_max_tokens")
     if cfg.exists():
         log(cfg.read_text(encoding="utf-8"))
     return rc
