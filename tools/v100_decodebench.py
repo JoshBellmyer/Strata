@@ -9,7 +9,7 @@ Every variant runs with STRATA_DECODE_TIMING and STRATA_SPLIT_TIMING (host clock
 engine logs ms per verify window split into waiting for the GPUs, the CPU experts, the draft, and per layer-window how
 many experts the CPU computed, VRAM hits and PCIe sends.  Those lines are copied from the engine log into this log.
 
-    .venv\\Scripts\\python tools\\v100_decodebench.py                    (what v100\\8_decode_tuning.bat runs)
+    .venv\\Scripts\\python tools\\v100_decodebench.py                    (what v100\\10_decode_split.bat runs)
     ... --variants baseline,v100_only --long-tokens 100000
 """
 from __future__ import annotations
@@ -76,8 +76,16 @@ VARIANTS.update({
                  {"STRATA_ARENA_PIN_GIB": "0"}, None),
     "plecache": ("a PLE row cache of 8M rows (~750 MB) instead of 1M", {"--ple-row-cache": "8388608"}, {}, None),
 })
-DEFAULT_ORDER = ["baseline", "every2", "minp07", "every2_minp07", "k12", "k14", "k20", "pagelock", "plecache",
-                 "baseline_end"]
+# round 4 (2026-10-03): the split point (k20 was best after 60K in round 3) and --spec-min-p 0.7, with two long-context
+# samples per run (the second is a follow-up turn on the same document)
+VARIANTS.update({
+    "k20_minp07": ("layers 0-19 on the 4070S, and --spec-min-p 0.7", {"--spec-min-p": "0.7"}, {}, split_at(20)),
+    "k22": ("layers 0-21 on the 4070S, 22-47 on the V100", {}, {}, split_at(22)),
+    "k24": ("layers 0-23 on the 4070S, 24-47 on the V100", {}, {}, split_at(24)),
+    "pagelock_p20": ("the RAM copy page-locked, and only 20% of CUDA0's misses over PCIe (--pcie-frac 0.2)",
+                     {"--pcie-frac": "0.2"}, {"STRATA_ARENA_PIN_GIB": "0"}, None),
+})
+DEFAULT_ORDER = ["baseline", "k20", "k20_minp07", "k22", "k24", "minp07", "pagelock_p20", "baseline_end"]
 ENGINE_LINE_KEYS = ("ple io", "page-locked", "locked resident", "decode timing", "decode GPU stages", "strata serve: stage ", "hit rate", "layer split auto",
                     "expert cache ", "layer split: CUDA", "strata serve: prompt ", "pcie_frac", "PCIe probe",
                     "resident RAM mode", "ERROR", "error", "failed")
@@ -154,9 +162,15 @@ def run_variant(name, base_cfg, tok, log, long_tokens):
         text = NB.haystack(int(long_tokens * NB.CHARS_PER_TOKEN))
         q = (f"Report {random.Random(7).randrange(10**9)}.\n" + text +
              "\n\nExplain in detail what this software does and how its parts fit together.")
-        _, r = ask(chat(tok, q), LONG_NEW, f"long ~{long_tokens // 1000}K")
-        res["long_tok_s"] = r["tok_s"]
-        res["long"] = r
+        ids1 = chat(tok, q)
+        out1, r = ask(ids1, LONG_NEW, f"long ~{long_tokens // 1000}K")
+        # a second sample at the same length: a follow-up turn (the document is reused from the prompt cache)
+        ids2 = ids1 + out1 + tok.encode("<|im_end|>\n<|im_start|>user\nNow list the main limitations the text "
+                                        "mentions, with a short explanation of each.<|im_end|>\n<|im_start|>assistant\n"
+                                        "<think>\n\n</think>\n\n", parse_special=True)
+        _, r2 = ask(ids2, LONG_NEW, f"long ~{long_tokens // 1000}K follow-up")
+        res["long_tok_s"] = round((r["tok_s"] + r2["tok_s"]) / 2, 2)
+        res["long"] = [r, r2]
         log(f"    SHORT median {res['short_tok_s']} tok/s; LONG {res['long_tok_s']} tok/s")
     except Exception as e:  # noqa: BLE001
         log("    VARIANT FAILED:", repr(e))

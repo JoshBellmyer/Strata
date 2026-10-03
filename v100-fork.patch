@@ -70,10 +70,10 @@ index 0da642f..1229072 100644
  
 diff --git a/docs/V100.md b/docs/V100.md
 new file mode 100644
-index 0000000..0d0086f
+index 0000000..bf9d8c4
 --- /dev/null
 +++ b/docs/V100.md
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,277 @@
 +# Tesla V100 + RTX 4070 Super + 96 GB RAM (this fork)
 +
 +This fork runs Unsloth's **UD-Q4_K_XL** of Qwen3.8-Flash-Next ([UNSLOTH_Q4.md](UNSLOTH_Q4.md)) on one specific PC:
@@ -324,6 +324,26 @@ index 0000000..0d0086f
 +~4.5-7 ms before each window, draft ~3 ms, commit ~1 ms. The V100 alone now spends 24 ms on its GPU and ~19-24 ms on
 +CPU experts: the 4070 Super's gain is its 1,746 extra expert slots (less CPU work), not GPU speed - its 17 layers take
 +about the time the V100 would.
++
++### Round 3 (2026-10-03, `v100_decodebench3.log`; config with `--adapt-swaps 32`)
++
++| Variant | Short chats | After 60K |
++| --- | ---: | ---: |
++| config, first / last run | 52.9 / 53.9 | 43.9 / 46.7 |
++| `--adapt-every 2` | 53.2 | 44.0 |
++| `--spec-min-p 0.7` | 54.8 | 46.2 |
++| both | 54.5 | 45.0 |
++| 4070S layers 0-11 / 0-13 / **0-19** | 47.1 / 51.2 / **53.7** | 41.4 / 42.1 / **48.6** |
++| RAM copy page-locked (`STRATA_ARENA_PIN_GIB=0`) | 46.7 | 43.4 |
++| PLE row cache 8M rows | 52.1 | 44.4 |
++
++- The run-to-run drift (first vs last) is ~1 tok/s short and ~3 tok/s long, so only k20 (long) stands out.
++- Page-locking 42 GB worked under WDDM (`page-locked and mapped`), and CUDA0 then sent 1.3-3.7 experts per
++  layer-window over PCIe, which cut its CPU time (10 -> 6.6 ms) but added more GPU waiting (6.5 -> 16 ms): a loss at
++  `--pcie-frac 0.55`. Its prompt path read 55,672 of 66,664 experts by DMA.
++- **PLE reads are slow on this drive**: the engine's reader logs p50 4-6.5 ms and p99 11-14 ms per 4 KB read (an
++  NVMe SSD answers in ~0.05-0.2 ms), and a bigger row cache does not help (most reads are first-time rows).
++  `v100\9_disk_test.bat` (no GPU) measures the drive outside the engine.
 +
 +## Not done yet (worth doing once the logs are in)
 +
@@ -1792,10 +1812,10 @@ index 0000000..43e0977
 +    sys.exit(main())
 diff --git a/tools/v100_decodebench.py b/tools/v100_decodebench.py
 new file mode 100644
-index 0000000..e9d9c8f
+index 0000000..904c3e9
 --- /dev/null
 +++ b/tools/v100_decodebench.py
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,215 @@
 +"""V100 fork: where the decode (writing) time goes on the 4070 Super + V100 split, and what changes it.
 +
 +Every variant restarts the engine with one change against the config (strata-unsloth-ud-q4_k_xl.json, 256K context)
@@ -1807,7 +1827,7 @@ index 0000000..e9d9c8f
 +engine logs ms per verify window split into waiting for the GPUs, the CPU experts, the draft, and per layer-window how
 +many experts the CPU computed, VRAM hits and PCIe sends.  Those lines are copied from the engine log into this log.
 +
-+    .venv\\Scripts\\python tools\\v100_decodebench.py                    (what v100\\8_decode_tuning.bat runs)
++    .venv\\Scripts\\python tools\\v100_decodebench.py                    (what v100\\10_decode_split.bat runs)
 +    ... --variants baseline,v100_only --long-tokens 100000
 +"""
 +from __future__ import annotations
@@ -1874,8 +1894,16 @@ index 0000000..e9d9c8f
 +                 {"STRATA_ARENA_PIN_GIB": "0"}, None),
 +    "plecache": ("a PLE row cache of 8M rows (~750 MB) instead of 1M", {"--ple-row-cache": "8388608"}, {}, None),
 +})
-+DEFAULT_ORDER = ["baseline", "every2", "minp07", "every2_minp07", "k12", "k14", "k20", "pagelock", "plecache",
-+                 "baseline_end"]
++# round 4 (2026-10-03): the split point (k20 was best after 60K in round 3) and --spec-min-p 0.7, with two long-context
++# samples per run (the second is a follow-up turn on the same document)
++VARIANTS.update({
++    "k20_minp07": ("layers 0-19 on the 4070S, and --spec-min-p 0.7", {"--spec-min-p": "0.7"}, {}, split_at(20)),
++    "k22": ("layers 0-21 on the 4070S, 22-47 on the V100", {}, {}, split_at(22)),
++    "k24": ("layers 0-23 on the 4070S, 24-47 on the V100", {}, {}, split_at(24)),
++    "pagelock_p20": ("the RAM copy page-locked, and only 20% of CUDA0's misses over PCIe (--pcie-frac 0.2)",
++                     {"--pcie-frac": "0.2"}, {"STRATA_ARENA_PIN_GIB": "0"}, None),
++})
++DEFAULT_ORDER = ["baseline", "k20", "k20_minp07", "k22", "k24", "minp07", "pagelock_p20", "baseline_end"]
 +ENGINE_LINE_KEYS = ("ple io", "page-locked", "locked resident", "decode timing", "decode GPU stages", "strata serve: stage ", "hit rate", "layer split auto",
 +                    "expert cache ", "layer split: CUDA", "strata serve: prompt ", "pcie_frac", "PCIe probe",
 +                    "resident RAM mode", "ERROR", "error", "failed")
@@ -1952,9 +1980,15 @@ index 0000000..e9d9c8f
 +        text = NB.haystack(int(long_tokens * NB.CHARS_PER_TOKEN))
 +        q = (f"Report {random.Random(7).randrange(10**9)}.\n" + text +
 +             "\n\nExplain in detail what this software does and how its parts fit together.")
-+        _, r = ask(chat(tok, q), LONG_NEW, f"long ~{long_tokens // 1000}K")
-+        res["long_tok_s"] = r["tok_s"]
-+        res["long"] = r
++        ids1 = chat(tok, q)
++        out1, r = ask(ids1, LONG_NEW, f"long ~{long_tokens // 1000}K")
++        # a second sample at the same length: a follow-up turn (the document is reused from the prompt cache)
++        ids2 = ids1 + out1 + tok.encode("<|im_end|>\n<|im_start|>user\nNow list the main limitations the text "
++                                        "mentions, with a short explanation of each.<|im_end|>\n<|im_start|>assistant\n"
++                                        "<think>\n\n</think>\n\n", parse_special=True)
++        _, r2 = ask(ids2, LONG_NEW, f"long ~{long_tokens // 1000}K follow-up")
++        res["long_tok_s"] = round((r["tok_s"] + r2["tok_s"]) / 2, 2)
++        res["long"] = [r, r2]
 +        log(f"    SHORT median {res['short_tok_s']} tok/s; LONG {res['long_tok_s']} tok/s")
 +    except Exception as e:  # noqa: BLE001
 +        log("    VARIANT FAILED:", repr(e))
@@ -1992,6 +2026,198 @@ index 0000000..e9d9c8f
 +        else:
 +            log(f"    {r['variant']:>10}: short chats {r.get('short_tok_s')}  (all {r.get('short_all')}), "
 +                f"after ~{a.long_tokens // 1000}K tokens {r.get('long_tok_s')}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/v100_disktest.py b/tools/v100_disktest.py
+new file mode 100644
+index 0000000..f9eae35
+--- /dev/null
++++ b/tools/v100_disktest.py
+@@ -0,0 +1,186 @@
++"""V100 fork: how fast the drive with the model files answers small random reads - NO GPU USED (safe any time).
++
++The engine reads layer 1's n-gram (PLE) table from the second GGUF shard with unbuffered 4 KB reads: ~16 per token,
++before every decode window.  On this PC the engine logged ~4-6 ms per read (p50), where an NVMe SSD should take
++~0.05-0.2 ms.  This measures the same kind of reads on that file outside the engine, and lists the drives, so the log
++shows whether the drive, the folder (OneDrive / Desktop redirection, a filter driver) or the engine is slow.
++
++    .venv\\Scripts\\python tools\\v100_disktest.py                 (what v100\\9_disk_test.bat runs)
++    ... --file D:\\models\\x.gguf                                  (another file / drive to compare)
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import random
++import statistics
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++WIN = os.name == "nt"
++BLOCK = 4096
++
++
++class Log:
++    def __init__(self, path):
++        self.f = open(path, "a", encoding="utf-8")
++
++    def __call__(self, *parts):
++        line = " ".join(str(p) for p in parts)
++        print(line, flush=True)
++        self.f.write(line + "\n")
++        self.f.flush()
++
++
++if WIN:
++    import ctypes
++    from ctypes import wintypes
++    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++    k32.CreateFileW.restype = wintypes.HANDLE
++    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
++                                wintypes.DWORD, wintypes.HANDLE]
++    k32.VirtualAlloc.restype = ctypes.c_void_p
++    k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
++    k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
++                             ctypes.c_void_p]
++    k32.SetFilePointerEx.argtypes = [wintypes.HANDLE, ctypes.c_longlong, ctypes.c_void_p, wintypes.DWORD]
++    k32.GetFileAttributesW.restype = wintypes.DWORD
++    k32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
++    k32.CloseHandle.argtypes = [wintypes.HANDLE]
++    GENERIC_READ, SHARE_RW, OPEN_EXISTING = 0x80000000, 0x3, 3
++    NO_BUFFERING, RANDOM_ACCESS = 0x20000000, 0x10000000
++
++    class Reader:
++        """One unbuffered handle (FILE_FLAG_NO_BUFFERING, as the engine's DirectFile) and a 4 KB-aligned buffer."""
++        def __init__(self, path):
++            self.h = k32.CreateFileW(str(path), GENERIC_READ, SHARE_RW, None, OPEN_EXISTING,
++                                     NO_BUFFERING | RANDOM_ACCESS, None)
++            if self.h in (None, wintypes.HANDLE(-1).value):
++                raise OSError(ctypes.get_last_error(), "CreateFileW failed")
++            self.buf = k32.VirtualAlloc(None, BLOCK, 0x3000, 0x04)
++            self.n = wintypes.DWORD(0)
++
++        def read(self, off):
++            k32.SetFilePointerEx(self.h, off, None, 0)
++            if not k32.ReadFile(self.h, self.buf, BLOCK, ctypes.byref(self.n), None):
++                raise OSError(ctypes.get_last_error(), "ReadFile failed")
++
++        def close(self):
++            k32.CloseHandle(self.h)
++else:
++    class Reader:
++        def __init__(self, path):
++            self.fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECT", 0))
++            import mmap
++            self.buf = mmap.mmap(-1, BLOCK)
++
++        def read(self, off):
++            os.preadv(self.fd, [self.buf], off)
++
++        def close(self):
++            os.close(self.fd)
++
++
++def pct(xs, p):
++    xs = sorted(xs)
++    return xs[min(len(xs) - 1, int(p * len(xs)))]
++
++
++def test_file(path: Path, log, n_qd1=1500, batches=40, batch=48):
++    size = path.stat().st_size
++    blocks = size // BLOCK - 1
++    log(f"\n--- {path}  ({size / 1e9:.1f} GB)")
++    if WIN:
++        attrs = k32.GetFileAttributesW(str(path))
++        flags = {0x400: "REPARSE_POINT", 0x1000: "OFFLINE", 0x40000: "RECALL_ON_OPEN", 0x400000: "RECALL_ON_DATA_ACCESS",
++                 0x80000: "PINNED", 0x100000: "UNPINNED", 0x800: "COMPRESSED", 0x4000: "ENCRYPTED",
++                 0x20000: "INTEGRITY_STREAM"}
++        log(f"    attributes 0x{attrs:x}: " + (", ".join(v for k, v in flags.items() if attrs & k) or "plain"))
++    rnd = random.Random(1)
++    r = Reader(path)
++    try:
++        # QD1: one read at a time (the latency of a single row)
++        lat = []
++        for _ in range(n_qd1):
++            off = rnd.randrange(blocks) * BLOCK
++            t0 = time.perf_counter()
++            r.read(off)
++            lat.append((time.perf_counter() - t0) * 1e3)
++        log(f"    one read at a time ({n_qd1}): p50 {pct(lat, .5):.3f} ms, p90 {pct(lat, .9):.3f} ms, p99 "
++            f"{pct(lat, .99):.3f} ms, mean {statistics.mean(lat):.3f} ms")
++    finally:
++        r.close()
++    # a decode window's worth: `batch` reads at once (threads, one handle each), the time until the last one lands
++    # (a pool of threads started beforehand, so thread start-up is not timed)
++    from concurrent.futures import ThreadPoolExecutor
++    readers = [Reader(path) for _ in range(batch)]
++    pool = ThreadPoolExecutor(max_workers=batch)
++    try:
++        list(pool.map(lambda i: readers[i].read(0), range(batch)))   # warm the pool
++        walls = []
++        for _ in range(batches):
++            offs = [rnd.randrange(blocks) * BLOCK for _ in range(batch)]
++            t0 = time.perf_counter()
++            list(pool.map(lambda i: readers[i].read(offs[i]), range(batch)))
++            walls.append((time.perf_counter() - t0) * 1e3)
++        log(f"    {batch} reads at once ({batches} batches): until the last lands p50 {pct(walls, .5):.2f} ms, "
++            f"p90 {pct(walls, .9):.2f} ms, max {max(walls):.2f} ms")
++    finally:
++        pool.shutdown()
++        for x in readers:
++            x.close()
++
++
++def ps(log, cmd):
++    try:
++        out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=60)
++        for line in (out.stdout or out.stderr).strip().splitlines():
++            log("    " + line.rstrip())
++    except Exception as e:  # noqa: BLE001
++        log("    powershell failed:", e)
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--config", default=str(ROOT / "strata-unsloth-ud-q4_k_xl.json"))
++    ap.add_argument("--file", action="append", help="another file to test (repeatable)")
++    ap.add_argument("--log", default=str(ROOT / "v100_disktest.log"))
++    a = ap.parse_args()
++    log = Log(a.log)
++    log(f"==== v100_disktest {time.strftime('%Y-%m-%d %H:%M:%S')}")
++    cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig"))
++    args = cfg["args"]
++    native = Path(args[args.index("--native") + 1])
++    log("    model folder:", native.parent)
++    for k in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
++        if os.environ.get(k):
++            inside = str(native).lower().startswith(os.environ[k].lower())
++            log(f"    {k} = {os.environ[k]}  (model folder inside it: {'YES' if inside else 'no'})")
++    files = sorted(native.parent.glob(native.name.replace("00001-of", "0000?-of")))
++    ple = [f for f in files if "-00002-of-" in f.name] or files[:1]
++    targets = ple + [Path(f) for f in (a.file or [])]
++    if WIN:
++        log("\n--- drives")
++        ps(log, "Get-PhysicalDisk | Select-Object DeviceId,FriendlyName,MediaType,BusType,"
++                "@{n='GB';e={[math]::Round($_.Size/1e9)}} | Format-Table -AutoSize | Out-String -Width 200")
++        ps(log, "Get-Partition | Where-Object DriveLetter | Select-Object DriveLetter,DiskNumber,"
++                "@{n='GB';e={[math]::Round($_.Size/1e9)}} | Format-Table -AutoSize | Out-String -Width 200")
++        ps(log, "Get-BitLockerVolume -ErrorAction SilentlyContinue | Select-Object MountPoint,ProtectionStatus,"
++                "EncryptionMethod | Format-Table -AutoSize | Out-String -Width 200")
++        ps(log, "powercfg /query SCHEME_CURRENT SUB_DISK 2>$null | Select-String -Pattern 'Name|Current AC' | "
++                "Out-String -Width 200")
++    for t in targets:
++        try:
++            test_file(t, log)
++        except Exception as e:  # noqa: BLE001
++            log(f"    {t}: failed: {e!r}")
++    log("\ndone")
 +    return 0
 +
 +
@@ -2699,6 +2925,26 @@ index 0000000..f087b8e
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+diff --git a/v100/10_decode_split.bat b/v100/10_decode_split.bat
+new file mode 100644
+index 0000000..c154d74
+--- /dev/null
++++ b/v100/10_decode_split.bat
+@@ -0,0 +1,14 @@
++@echo off
++rem V100 fork, step 10 - the split point between the cards and the draft length, measured more carefully.
++rem   USES BOTH GPUs, ~45 minutes, nothing is compiled.  Eight engine runs: the config first and last, the 4070 Super
++rem   with 20 / 22 / 24 layers, 20 layers with shorter drafts, shorter drafts alone, and the page-locked RAM copy with
++rem   a smaller PCIe share.  Each writes 256 tokens for three short chats (twice) and 2 x 300 tokens after ~60K tokens.
++rem   Logs: v100_decodebench4.log (+ .json).
++setlocal
++cd /d "%~dp0.."
++echo This uses both GPUs for about 45 minutes. Stop any other GPU program first.
++pause
++".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench4.log %*
++echo.
++echo Done. Send v100_decodebench4.log back for review.
++pause
 diff --git a/v100/1_setup_and_build.bat b/v100/1_setup_and_build.bat
 new file mode 100644
 index 0000000..62fa55b
@@ -2891,4 +3137,20 @@ index 0000000..f2df90d
 +".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench3.log %*
 +echo.
 +echo Done. Send v100_decodebench3.log back for review.
++pause
+diff --git a/v100/9_disk_test.bat b/v100/9_disk_test.bat
+new file mode 100644
+index 0000000..d29b3a9
+--- /dev/null
++++ b/v100/9_disk_test.bat
+@@ -0,0 +1,10 @@
++@echo off
++rem V100 fork, step 9 - how fast the model files' drive answers small random reads.  NO GPU USED: safe to run any
++rem   time, even with the other server running (~1 minute).  Log: v100_disktest.log.
++rem   Another drive to compare: 9_disk_test.bat --file D:\some\big\file.bin
++setlocal
++cd /d "%~dp0.."
++".venv\Scripts\python.exe" tools\v100_disktest.py %*
++echo.
++echo Done. Send v100_disktest.log back for review.
 +pause
