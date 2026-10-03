@@ -3862,6 +3862,8 @@ int main(int argc, char** argv) {
             int32_t first_now = -1;        // where its buffers are laid out now
             int64_t lent_chunk = 0;
             std::vector<std::pair<int32_t, int32_t>> lent;
+            int64_t chunk = 0;             // V100 fork: this participant's largest chunk (a later stage may read
+                                           // in bigger chunks than CUDA0: Prefill gathers the hand-offs)
         };
         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
             const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, c);
@@ -3935,8 +3937,42 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens so its buffers fit in "
                                          "every expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
                 o.prefill_chunk = chunk;
+                for (PfPart& p : pf_parts) p.chunk = chunk;
+                // V100 fork: PER-STAGE CHUNKS.  The common chunk is the largest one EVERY participant can lend - on
+                // a 12 GB + 32 GB split that is the small card's limit, and the big card then streams its
+                // non-resident experts once per small chunk.  With `--prefill auto` (auto:N above 8192), the stage
+                // after CUDA0 takes the largest chunk (up to N) that IT can lend under the same rules, a multiple of
+                // CUDA0's: CUDA0's chunks are gathered into one hand-off (Prefill::run).  Stages after it receive one
+                // hand-off per run of the stage before them, so they gain nothing above that stage's chunk.  The tokens and the
+                // order of every layer's work are the same, so the answers are; only the expert stream changes.
+                // STRATA_SPLIT_STAGE_CHUNKS=0: one chunk for all (as before).
+                static const bool stage_chunks_ok = [] {
+                    const char* v = std::getenv("STRATA_SPLIT_STAGE_CHUNKS");
+                    return v == nullptr || v[0] != '0';
+                }();
+                if (o.prefill_auto && stage_chunks_ok && pf_parts.size() > 1) {
+                    for (size_t i = 1; i < pf_parts.size(); ++i) {
+                        PfPart& p = pf_parts[i];
+                        const int64_t floor_c = pf_parts[i - 1].chunk;
+                        const int64_t top_c = i == 1 ? INT64_MAX : pf_parts[1].chunk;
+                        p.chunk = floor_c;
+                        for (const int64_t c : kAutoChunks) {
+                            if (c <= floor_c) break;
+                            if (c > o.prefill_auto_max || c > o.max_context || c > top_c || c % floor_c != 0) continue;
+                            const int64_t k = part_slots(p, c);
+                            if (k > 0 && k + 128 <= p.cache->slots() && k * 100 <= kAutoLendPct * p.cache->slots()) {
+                                p.chunk = c;
+                                break;
+                            }
+                        }
+                        if (p.chunk > chunk)
+                            std::fprintf(stderr, "strata serve:   CUDA%d reads the prompt in %lld-token chunks (the "
+                                                 "earlier stage's chunks are gathered for it)\n", p.dev,
+                                         (long long) p.chunk);
+                    }
+                }
                 for (PfPart& p : pf_parts) {
-                    p.first = (int32_t) (p.cache->slots() - part_slots(p, chunk));
+                    p.first = (int32_t) (p.cache->slots() - part_slots(p, p.chunk));
                     p.first_now = p.first;
                 }
                 // #340: a split stage whose card still has room for the chunk's buffers (its cache already holds
@@ -3954,7 +3990,7 @@ int main(int argc, char** argv) {
                         const strata::core::OnDevice on(p.dev);
                         size_t fb = 0, tb = 0;
                         if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
-                        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, chunk);
+                        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, p.chunk);
                         if ((uint64_t) fb >= need + (3ull << 29)) {
                             std::fprintf(stderr, "strata serve:   CUDA%d keeps its own prompt buffers (%.2f GiB of "
                                                  "%.2f GiB free): no loan\n", p.dev < 0 ? 0 : p.dev,
@@ -4004,6 +4040,26 @@ int main(int argc, char** argv) {
         // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned (#253) a
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
+        // V100 fork: the chunk stage i (pf_parts[i + 1]) reads in - the common one without per-stage chunks
+        auto stage_chunk = [&](size_t i) -> int64_t {
+            return i + 1 < pf_parts.size() && pf_parts[i + 1].chunk > o.prefill_chunk ? pf_parts[i + 1].chunk
+                                                                                      : o.prefill_chunk;
+        };
+        // back to one chunk for all (a stage's bigger chunk did not fit after all)
+        auto collapse_stage_chunks = [&]() -> bool {
+            bool any = false;
+            for (PfPart& p : pf_parts) {
+                if (p.chunk > o.prefill_chunk) any = true;
+                p.chunk = o.prefill_chunk;
+                if (p.first >= 0) {
+                    p.first = (int32_t) (p.cache->slots() - part_slots(p, p.chunk));
+                    p.first_now = p.first;
+                }
+            }
+            if (any) std::fprintf(stderr, "strata serve: every stage reads the prompt in %lld-token chunks\n",
+                                  (long long) o.prefill_chunk);
+            return any;
+        };
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
@@ -4016,7 +4072,7 @@ int main(int argc, char** argv) {
                     sb = st.cache.device_slot(pf_parts[i + 1].first);
                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                 }
-                if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
+                if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), stage_chunk(i), (void*) st.stream,
                                 err, sb, sbb)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
                     return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -4041,7 +4097,10 @@ int main(int argc, char** argv) {
                     const strata::core::OnDevice on(dev);
                     size_t fb = 0, tb = 0;
                     cudaMemGetInfo(&fb, &tb);
-                    const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, c);
+                    // a stage's own bigger chunk, when it has one (the step-down below prices smaller ones)
+                    const int64_t cs_i = i > 0 && i < pf_parts.size() && pf_parts[i].chunk > o.prefill_chunk
+                                             ? std::max(c, pf_parts[i].chunk) : c;
+                    const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, cs_i);
                     if (need + kHeadroom > (int64_t) fb) {
                         dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
                         return false;
@@ -4051,6 +4110,7 @@ int main(int argc, char** argv) {
             };
             int dev = 0;
             int64_t need = 0, fb = 0;
+            if (!own_fits(o.prefill_chunk, dev, need, fb) && collapse_stage_chunks()) {}
             if (!own_fits(o.prefill_chunk, dev, need, fb)) {
                 int64_t c = 0;
                 for (const int64_t s : kStepChunks) {
@@ -4063,12 +4123,30 @@ int main(int argc, char** argv) {
                                          "%lld MiB free: %lld-token chunks\n", (long long) o.prefill_chunk,
                                  (long long) (need >> 20), dev, (long long) (fb >> 20), (long long) c);
                     o.prefill_chunk = c;
+                    for (PfPart& p : pf_parts) p.chunk = std::min(p.chunk, c);   // (loans keep their planned size)
                 }
             }
         }
         for (;;) {
             const int r = init_prompt_paths();
             if (r == 0) break;
+            if (r == 2 && collapse_stage_chunks()) {   // first without the bigger stage chunks, at the same chunk
+                std::fprintf(stderr, "strata serve: %s: trying one chunk for every stage\n", err.c_str());
+                for (auto& stp : stages) {
+                    const strata::core::OnDevice on(stp->dev);
+                    stp->sp.reset();
+                    (void) cudaGetLastError();
+                }
+                sp.reset();
+                (void) cudaGetLastError();
+                if (any_loan) {
+                    lend_first = pf_parts[0].first;
+                    borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
+                    borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
+                }
+                err.clear();
+                continue;
+            }
             int64_t next = 0;
             for (const int64_t c : kStepChunks)
                 if (c < o.prefill_chunk) { next = c; break; }
@@ -4084,6 +4162,7 @@ int main(int argc, char** argv) {
                 sp.reset();
                 (void) cudaGetLastError();
                 o.prefill_chunk = next;
+                for (PfPart& p : pf_parts) p.chunk = next;
                 if (any_loan) {                  // smaller loans for the smaller chunk
                     for (PfPart& p : pf_parts)
                         if (p.first >= 0) {
@@ -5168,17 +5247,21 @@ int main(int argc, char** argv) {
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
-                const int64_t want_full = request_chunk(tokens, o.prefill_chunk);
-                // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
-                const int64_t want = split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
-                                                                                 : want_full;
-                if (want <= 0) {
+                // V100 fork: per participant - a later stage may read in bigger chunks (PfPart::chunk)
+                auto want_of = [&](const PfPart& p) -> int64_t {
+                    const int64_t want_full = request_chunk(tokens, p.sp->max_chunk());
+                    // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
+                    return split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small) : want_full;
+                };
+                const int64_t want0 = want_of(pf_parts[0]);   // CUDA0's (and the trace line's)
+                if (want0 <= 0) {
                     e = "prefill: cannot lend buffers for an empty request segment";
                     return false;
                 }
                 bool any = false;
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
+                    const int64_t want = want_of(p);
                     if (!p.lent.empty()) {
                         if (want <= p.lent_chunk) continue;            // its current loan already covers this
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
@@ -5208,7 +5291,7 @@ int main(int argc, char** argv) {
                     int64_t n_lent = 0;
                     for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
                     std::fprintf(stderr, "strata trace: lent %lld slots for %lld tokens in %.1f ms\n", (long long) n_lent,
-                                 (long long) want, std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count());
+                                 (long long) want0, std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count());
                     std::fflush(stderr);
                 }
                 return true;
@@ -5614,6 +5697,32 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)\n",
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look);
+            }
+            // V100 fork: each prompt path's share of this request - its chunk, the experts it streamed to its card
+            // (and how many of them by DMA straight from page-locked RAM), the host time staging the others, and the
+            // time spent reading experts from the model files (lent slots' experts, mostly)
+            {
+                static std::vector<strata::prefill::PrefillStats> pf_prev;
+                static double file_ms_prev = 0.0;
+                pf_prev.resize(stages.size() + 1);
+                for (size_t i = 0; i <= stages.size(); ++i) {
+                    const strata::prefill::Prefill& psp = i == 0 ? sp : stages[i - 1]->sp;
+                    const strata::prefill::PrefillStats& a = psp.stats();
+                    strata::prefill::PrefillStats& b = pf_prev[i];
+                    if (a.tokens > b.tokens)
+                        std::fprintf(stderr, "strata serve: prompt path CUDA%d: %lld tokens in %lld chunks (chunk %lld), "
+                                             "%.0f ms; %lld experts streamed (%lld by DMA), host staging %.0f ms\n",
+                                     i == 0 ? 0 : stages[i - 1]->dev, (long long) (a.tokens - b.tokens),
+                                     (long long) (a.chunks - b.chunks), (long long) psp.chunk(), a.ms_total - b.ms_total,
+                                     (long long) (a.experts_streamed - b.experts_streamed),
+                                     (long long) (a.experts_dma - b.experts_dma), a.ms_experts_host - b.ms_experts_host);
+                    b = a;
+                }
+                if (srcp == &src && src.file_ms() > file_ms_prev) {
+                    std::fprintf(stderr, "strata serve: expert reads from the model files this request: %.0f ms\n",
+                                 src.file_ms() - file_ms_prev);
+                    file_ms_prev = src.file_ms();
+                }
             }
             // the resident RAM mode, cumulative: experts read from experts.bin since the copy was made (what the plain
             // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)

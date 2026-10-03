@@ -361,6 +361,7 @@ struct Prefill::Impl {
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
     float* hand[2] = {};
+    int64_t hand_rows = 0;                   // rows each hand-off buffer holds (the next stage's chunk may be bigger)
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
@@ -524,9 +525,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         return false;
     }
     for (int b = 0; next_ != nullptr && b < 2; ++b)
-        if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
-            err = "prefill: the layer split's hand-off buffers";
-            return false;
+        if (!m.hand[b]) {
+            if (cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
+                err = "prefill: the layer split's hand-off buffers";
+                return false;
+            }
+            m.hand_rows = chunk;
         }
     if (m.tok_dev == nullptr) {
         if (const cudaError_t e = cudaMalloc((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t)); e != cudaSuccess) {
@@ -731,6 +735,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+int64_t Prefill::max_chunk() const { return impl_->T_max; }
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err) {
@@ -1002,6 +1007,36 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     std::string next_err;
     std::future<bool> next_run;
     int hand_buf = 0;
+    // V100 fork: PER-STAGE CHUNKS.  The next stage may read in bigger chunks than this one (a card with a bigger
+    // expert cache can lend a bigger chunk's buffers): this stage's chunks are gathered in the hand-off buffer and
+    // handed on together, up to the next stage's chunk.  Each layer is causal in the positions, so a stage reading
+    // [a, b) and then [b, c) leaves the same state as one reading [a, c); only the expert stream changes - the next
+    // stage streams its non-resident experts once per ITS chunk.  The buffers grow here (between prompts: no
+    // hand-off is in flight); if the bigger ones cannot be pinned, the old size is kept and the hand-offs are smaller.
+    int64_t hand_cap = 0;   // rows per hand-off
+    int64_t acc0 = 0, acc_n = 0;   // the gathered rows: this run's offset and count
+    if (next_ != nullptr) {
+        const int64_t want = std::max(m.T, next_->impl_->T);
+        if (want > m.hand_rows) {
+            float* nh[2] = {};
+            bool got = true;
+            for (int b = 0; b < 2 && got; ++b)
+                got = cudaHostAlloc((void**) &nh[b], (size_t) want * D * 4, cudaHostAllocPortable) == cudaSuccess;
+            if (got) {
+                for (int b = 0; b < 2; ++b) {
+                    if (m.hand[b]) cudaFreeHost(m.hand[b]);
+                    m.hand[b] = nh[b];
+                }
+                m.hand_rows = want;
+            } else {
+                (void) cudaGetLastError();
+                for (int b = 0; b < 2; ++b) if (nh[b]) cudaFreeHost(nh[b]);
+                std::fprintf(stderr, "strata prefill: the %lld-row hand-off buffers could not be pinned: hand-offs "
+                                     "of %lld rows\n", (long long) want, (long long) m.hand_rows);
+            }
+        }
+        hand_cap = std::max(m.T, std::min(want, m.hand_rows));
+    }
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
@@ -1864,21 +1899,30 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
         if (next_ != nullptr) {
-            // the rows to the host buffer the next stage read two chunks ago (it has finished: waited below)
+            // the rows to the host buffer the next stage read two hand-offs ago (it has finished: waited below),
+            // after the rows of this stage's earlier chunks gathered for the same hand-off
             float* h = m.hand[hand_buf];
-            if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+            if (acc_n == 0) acc0 = c0;
+            if (cudaMemcpyAsync(h + (size_t) acc_n * D, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
                 cudaStreamSynchronize(m.cs) != cudaSuccess) {
                 err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
-            // this stage's state is at the chunk's end now (synced) and moves on with the next chunk below
+            acc_n += T;
+            // gather the next chunk too when it still fits the next stage's chunk
+            const int64_t c_next = c0 + T;
+            if (c_next < n && acc_n + std::min(m.T, n - c_next) <= hand_cap) continue;
+            // this stage's state is at the hand-off's end now (synced) and moves on with the next chunk below.
+            // Only here: the next stage reports (and saves its checkpoint part) at hand-off boundaries, so a part
+            // saved between them would never be completed.
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
             next_->hand_in_ = h;
-            next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err] {
-                return next_->run(tokens + c0, T, p0, next_err);
+            next_run = std::async(std::launch::async, [this, tokens, a0 = acc0, an = acc_n, ap = pos0 + acc0, &next_err] {
+                return next_->run(tokens + a0, an, ap, next_err);
             });
             hand_buf ^= 1;
+            acc_n = 0;
             continue;   // the last stage reports the chunk (on_chunk)
         }
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
@@ -1949,8 +1993,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             std::snprintf(b, sizeof b, " %s %.0f (%.1f%%)", kPfNames[i], pt.ms[i], total > 0 ? 100.0 * pt.ms[i] / total : 0.0);
             line += b;
         }
-        std::fprintf(stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s\n",
-                     (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str());
+        std::fprintf(stderr, "strata prefill timing: CUDA%d layers %lld-%lld, %lld tokens in chunks of %lld, GPU timeline "
+                             "%.0f ms, wall %.0f ms, host staging %.0f ms:%s\n", m.device, (long long) LB,
+                     (long long) LE - 1, (long long) n, (long long) m.T, total, ms_since(t_start),
+                     stats_.ms_experts_host, line.c_str());
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
