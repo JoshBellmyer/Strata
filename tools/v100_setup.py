@@ -147,8 +147,12 @@ def main() -> int:
         # v100_decodebench3/4 (2026-10-03): --spec-min-p 0.7 was a little ahead in every round; layers 0-19 on the
         # 4070 Super decode as fast as 0-16 (17-22 are within the noise) and read prompts ~7% faster (the V100
         # streams fewer layers' experts)
+        # v100_workload (2026-10-03, a real hour at 30-213K context): new text of 65-768 tokens read batched took 3.6-10 s
+        # (the V100 streams every routed expert it lacks over its x4 link); the decode windows read ~13 ms a token,
+        # which is faster up to ~1000 tokens: --short-read 768 (was 64) saves ~165 s an hour of that work
         for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11"), ("--prefill", "auto:32768"),
-                          ("--adapt-swaps", "32"), ("--spec-min-p", "0.7")):
+                          ("--adapt-swaps", "32"), ("--spec-min-p", "0.7"),
+                          ("--short-read", "768")):
             if flag in c["args"]:
                 c["args"][c["args"].index(flag) + 1] = val
             else:
@@ -168,7 +172,7 @@ def main() -> int:
                 log(f"  the PLE table from its own file: {own[0].name}")
         cfg.write_text(json.dumps(c, indent=1), encoding="utf-8")
         log("  tuned for this PC: --pool-affinity auto --pool-workers 11 --prefill auto:32768 --adapt-swaps 32 "
-            "--spec-min-p 0.7, layer_split 20")
+            "--spec-min-p 0.7 --short-read 768, layer_split 20")
     if cfg.exists():
         log(cfg.read_text(encoding="utf-8"))
     return rc

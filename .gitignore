@@ -49,3 +49,7 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+# V100 fork: workload recordings (tools/v100_workload.py - engine logs, routing.bin of several hundred MB, zips)
+/runs/
+# the build script tools/v100_ple_split.py writes
+/build-v100-*.bat
