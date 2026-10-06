@@ -21,10 +21,19 @@ ROOT = Path(__file__).resolve().parents[1]
 WIN = os.name == "nt"
 
 # the GPU test programs the second script runs (all synthetic: no model needed); built next to the engine
-TEST_TARGETS = ["bf16_gemm_fallback_test", "native_expert_parity", "mmvq_multi_parity", "gr_parity", "gdn_parity",
+TEST_TARGETS = ["native_expert_parity", "mmvq_multi_parity", "gr_parity", "gdn_parity",
                 "qsa_parity", "kv_q8_parity", "elementwise_parity", "sampler_parity", "router_top10_parity",
                 "rope_parity", "quantize_act_parity", "shared_expert_parity", "bf16_gemv_parity",
-                "s_gemv_q8k_parity", "prefill_mmq_kquant_test", "strata-device"]
+                "s_gemv_q8k_parity", "strata-device"]
+
+
+def build_dir() -> Path:
+    """Setup's build folder for this PC's engine: build-cuda12/ (since upstream 0.1.40 a V100 runs the experimental
+    CUDA 12 engine, in engine-cuda12/), else build/ (the fork's builds before the merge)."""
+    for d in ("build-cuda12", "build"):
+        if (ROOT / d / "CMakeCache.txt").exists():
+            return ROOT / d
+    return ROOT / "build-cuda12"
 
 
 class Tee:
@@ -96,7 +105,7 @@ def main() -> int:
     if not a.skip_setup:
         cmd = [py, str(ROOT / "setup.py"), "--setup", "--build", "--yes", "--no-start", "--family", "unsloth",
                "--model", "UD-Q4_K_XL", "--gpus", order, "--context", str(a.context), "--vision", "no",
-               "--experimental-speed-projection", "off"]
+               "--experimental-speed-projection", "off", "--cuda", "12", "--no-remote-expert-opt"]
         gguf_dir = a.gguf_dir
         old_cfg = ROOT / "strata-unsloth-ud-q4_k_xl.json"
         if not gguf_dir and old_cfg.exists():
@@ -121,11 +130,12 @@ def main() -> int:
     sys.path.insert(0, str(ROOT))
     import setup as S                                      # noqa: E402
     cmake, ninja = S.find_tool("cmake"), S.find_tool("ninja")
-    if not (ROOT / "build" / "CMakeCache.txt").exists() or cmake is None:
-        log("  no build/CMakeCache.txt (setup did not compile the engine?) - the test programs are not built")
+    bdir = build_dir()
+    if not (bdir / "CMakeCache.txt").exists() or cmake is None:
+        log(f"  no {bdir.name}/CMakeCache.txt (setup did not compile the engine?) - the test programs are not built")
         return 1
     jobs = str(max(2, (os.cpu_count() or 4) // 2))
-    build = [cmake, "--build", str(ROOT / "build"), "-j", jobs, "--target", *TEST_TARGETS]
+    build = [cmake, "--build", str(bdir), "-j", jobs, "--target", *TEST_TARGETS]
     if WIN:
         vcvars = S.find_vcvars()
         if vcvars is None:
@@ -140,7 +150,7 @@ def main() -> int:
     log(f"  test programs build exit code {rc}")
     exe = ".exe" if WIN else ""
     for t in TEST_TARGETS:
-        p = ROOT / "build" / (t + exe)
+        p = bdir / (t + exe)
         log(f"    {'ok     ' if p.exists() else 'MISSING'} {p}")
     cfg = ROOT / "strata-unsloth-ud-q4_k_xl.json"
     log(f"  config: {cfg} {'(present)' if cfg.exists() else '(MISSING)'}")
@@ -159,9 +169,11 @@ def main() -> int:
         # v100_workload (2026-10-03, a real hour at 30-213K context): new text of 65-768 tokens read batched took 3.6-10 s
         # (the V100 streams every routed expert it lacks over its x4 link); the decode windows read ~13 ms a token,
         # which is faster up to ~1000 tokens: --short-read 768 (was 64) saves ~165 s an hour of that work
+        # upstream 0.1.40 merge: the fork's adaptive tier without stalls (decode 38.6 -> 52.4 tok/s) is upstream's
+        # --adapt-async 1 now (the same three steps on a worker, per card on a split); it is opt-in there
         for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11"), ("--prefill", "auto:32768"),
                           ("--adapt-swaps", "32"), ("--spec-min-p", "0.7"),
-                          ("--short-read", "768")):
+                          ("--short-read", "768"), ("--adapt-async", "1")):
             if flag in c["args"]:
                 c["args"][c["args"].index(flag) + 1] = val
             else:
@@ -169,6 +181,13 @@ def main() -> int:
         # clients that ask for "the rest of the context" from their own token estimate (pi after a compaction asked
         # 4K over): fit max_tokens to the room left instead of rejecting the request with a 400
         c["fit_max_tokens"] = True
+        # --remote-expert-opt is for helper expert caches (not a layer split) and turns --adapt-async off
+        if "--remote-expert-opt" in c["args"]:
+            c["args"].remove("--remote-expert-opt")
+        c["remote_expert_opt"] = False
+        # the async tier's copy thread: its default spot (the last P-core's SMT sibling) is a pool worker's on this
+        # PC (11 workers fill the P-cores' 12 threads but the host's), so it is left to the OS
+        c.setdefault("env", {})["STRATA_ADAPT_JOB_CPU"] = "-1"
         for k, v in keep.items():
             c.setdefault(k, v)
         if isinstance(c.get("gpu"), list) and len(c["gpu"]) == 2:
@@ -186,7 +205,7 @@ def main() -> int:
                 log(f"  the PLE table from its own file: {own[0].name}")
         cfg.write_text(json.dumps(c, indent=1), encoding="utf-8")
         log("  tuned for this PC: --pool-affinity auto --pool-workers 11 --prefill auto:32768 --adapt-swaps 32 "
-            "--spec-min-p 0.7 --short-read 768, layer_split 20, fit_max_tokens")
+            "--spec-min-p 0.7 --short-read 768 --adapt-async 1, layer_split 20, fit_max_tokens")
     if cfg.exists():
         log(cfg.read_text(encoding="utf-8"))
     return rc

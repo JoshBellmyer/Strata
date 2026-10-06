@@ -1,139 +1,50 @@
 diff --git a/.gitignore b/.gitignore
-new file mode 100644
-index 0000000..5e45ecf
---- /dev/null
+index acca09f..307aa8f 100644
+--- a/.gitignore
 +++ b/.gitignore
-@@ -0,0 +1,55 @@
-+# Generated, not source: deterministic build products of tools/ (see docs/).
-+# tiny-qwen4exp.gguf is ~113 MB, over GitHub's 100 MB file limit -- regenerate with
-+#   python tools/make_tiny_model.py
-+bench/tiny-*.gguf
-+bench/wide-*.gguf
-+bench/micro/*.exe
-+bench/micro/*.obj
-+bench/micro/*.bin
-+bench/micro/*.dll
-+bench/micro/*.txt
-+*.log
-+build*/
-+pack/
-+logs/
-+__pycache__/
-+.pytest_cache/
-+*.pyc
-+
-+# plan v0.3 P1 (repository hygiene, review E1): profiler captures and large diagnostic dumps stay out of git.
-+*.nsys-rep
-+
-+# Pi harness metadata (local session state, not project source)
-+*.sqlite
-+*.npz
-+*.occ1
-+td.log
-+
-+# created by setup.py on the user's machine
-+/.venv/
-+/build/
-+/third_party/llama.cpp
-+/models/
-+/packs/
-+/mtp/
-+/run-*.bat
-+/run-*.sh
-+/strata-*.json
-+/strata-*.log
-+/build-strata.bat
-+
-+# image encoder (setup.py --vision): build output and the generated build script
-+build-vision*/
-+build-vision.bat
-+
-+# setup.py outputs (engine, downloads) and release builds
-+/engine/
-+/build-release*/
-+/dist/
-+*.done
-+/third_party/*.zip
+@@ -61,3 +61,11 @@ build-vision-cuda12.bat
+ 
+ /.ccache/
+ /.rocm-win/
 +
 +# V100 fork: workload recordings (tools/v100_workload.py - engine logs, routing.bin of several hundred MB, zips)
 +/runs/
-+# the build script tools/v100_ple_split.py writes
++# the build scripts tools/v100_setup.py and tools/v100_ple_split.py write
 +/build-v100-*.bat
++# V100 fork: config backups (step 17, setup) and bench results (v100_*bench*.json beside their .log)
++/strata-*.json.*
++/v100_*.json
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 0105884..41c72b9 100644
+index cd60517..dbc8760 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -107,8 +107,20 @@ if(STRATA_ENABLE_CUDA)
-                       "CUDA 12.8 crashed on long prompts on these cards (issues #220, #224). Use CUDA 13.0 or newer.")
+@@ -183,6 +183,7 @@ elseif(STRATA_ENABLE_CUDA)
      endif()
    endforeach()
-+  if(STRATA_EXPERIMENTAL_SM60)   # CUDA 12.x warns on every file that sm_70 support will go; it is known
-+    string(APPEND CMAKE_CUDA_FLAGS " -Wno-deprecated-gpu-targets")
-+  endif()
-   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
--  set(_strata_gpu_runtime_target CUDA::cudart)
-+  # V100 fork: ONE CUDA runtime on Windows.  A C++ executable that links CUDA objects also gets CUDA's implicit link
-+  # libraries from the compiler probe (cudadevrt + cudart_static), whatever CMAKE_CUDA_RUNTIME_LIBRARY says; with
-+  # CUDA::cudart (the DLL's import library) beside it, MSVC refuses the link: LNK2005 for every cuda* symbol, LNK1169
-+  # (CUDA 12.9 + CMake 4.4).  The static runtime is nvcc's own default, so link that one everywhere instead (cuBLAS
-+  # stays a DLL; it does not depend on the runtime DLL).
-+  if(MSVC)
-+    set(_strata_gpu_runtime_target CUDA::cudart_static)
-+  else()
-+    set(_strata_gpu_runtime_target CUDA::cudart)
-+  endif()
-   set(_strata_gpu_blas_target CUDA::cublas)
-   set(_strata_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
- elseif(STRATA_ENABLE_HIP)
-@@ -272,7 +284,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
-   if((STRATA_BUILD_TESTS OR STRATA_PARITY_PROMPT_ATTN) AND STRATA_ENABLE_CUDA)
-     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
-     target_include_directories(qsa_prompt_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
--    target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels CUDA::cudart)
-+    target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
-   endif()
-   # the QSA selection (block scores on the warp kernel and the tensor-core one, top-k): a GPU bench with a
-   # scorer-vs-scorer comparison and an FP64 accuracy gate (synthetic, no model); the ctest runs a 32K context under a
-@@ -401,6 +413,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
-   add_executable(strata src/program/generate.cpp)
-   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
-   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
-+  # V100 fork: the prompt path's BF16 GEMM on this GPU - cuBLAS's GemmEx, or the FP32 fallback kernel Volta needs
-+  # when cuBLAS has no BF16 GEMM for it (GPU, synthetic, no model)
-+  if(STRATA_ENABLE_CUDA)
-+    add_executable(bf16_gemm_fallback_test tests/cuda/bf16_gemm_fallback_test.cpp)
-+    target_link_libraries(bf16_gemm_fallback_test PRIVATE strata_prefill ${_strata_gpu_runtime_target})
-+  endif()
- 
-   if(STRATA_ENABLE_HIP)
-     enable_testing()
-@@ -880,7 +898,7 @@ if(STRATA_NATIVE_EXPERTS)
-     endif()
-     target_link_libraries(strata_prefill PUBLIC strata_mmq)
-     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
--    if(STRATA_BUILD_TESTS AND STRATA_MMQ_KQUANTS)
-+    if(STRATA_MMQ_KQUANTS)   # V100 fork: built whenever the kernels are (the GPU test script runs it)
-       # the UD-Q4_K_XL expert formats through MMQ against ggml's dequantized weights (synthetic, a few seconds)
-       add_executable(prefill_mmq_kquant_test tests/cuda/prefill_mmq_kquant_test.cpp)
-       target_link_libraries(prefill_mmq_kquant_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+   if(STRATA_EXPERIMENTAL_SM60)
++    string(APPEND CMAKE_CUDA_FLAGS " -Wno-deprecated-gpu-targets")   # V100 fork: CUDA 12.x warns on every file
+     # every target sees it: the Pascal / Volta code paths (the Volta prompt attention, PR #600) are compiled into this
+     # build only, so the ready-made engine (sm_75+) keeps exactly the code it had
+     add_compile_definitions(STRATA_EXPERIMENTAL_SM60=1)
 diff --git a/README.md b/README.md
-index 0da642f..1229072 100644
+index a8184b6..04ad8fb 100644
 --- a/README.md
 +++ b/README.md
-@@ -1,5 +1,8 @@
+@@ -1,5 +1,9 @@
  <h1 align="center">Strata</h1>
  
-+> **This fork:** Tesla V100 (sm_70) support and a layer-split RAM-budget mode for Unsloth's UD-Q4_K_XL on an
-+> RTX 4070 Super + Tesla V100 + 96 GB PC - see [docs/V100.md](docs/V100.md) and the scripts in `v100/`.
++> **This fork:** Tesla V100 (sm_70) tuning for Unsloth's UD-Q4_K_XL on an RTX 4070 Super + Tesla V100 + 96 GB
++> PC (layer split with a RAM budget, per-card prompt chunks, the PLE table in its own file) - see
++> [docs/V100.md](docs/V100.md), [SERVER-SETUP-INFO.md](SERVER-SETUP-INFO.md) and the scripts in `v100/`.
 +
- <p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>
- one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to install</p>
+ **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
  
-diff --git a/SERVER-SETTINGS.md b/SERVER-SETTINGS.md
+ <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
+diff --git a/SERVER-SETUP-INFO.md b/SERVER-SETUP-INFO.md
 new file mode 100644
-index 0000000..3619f79
+index 0000000..52dc0df
 --- /dev/null
-+++ b/SERVER-SETTINGS.md
++++ b/SERVER-SETUP-INFO.md
 @@ -0,0 +1,62 @@
 +# Strata server settings: sampling and the model
 +
@@ -199,10 +110,10 @@ index 0000000..3619f79
 +A different architecture or file format needs more work than this.
 diff --git a/docs/V100.md b/docs/V100.md
 new file mode 100644
-index 0000000..7a08e59
+index 0000000..db4ed9a
 --- /dev/null
 +++ b/docs/V100.md
-@@ -0,0 +1,352 @@
+@@ -0,0 +1,413 @@
 +# Tesla V100 + RTX 4070 Super + 96 GB RAM (this fork)
 +
 +This fork runs Unsloth's **UD-Q4_K_XL** of Qwen3.8-Flash-Next ([UNSLOTH_Q4.md](UNSLOTH_Q4.md)) on one specific PC:
@@ -235,6 +146,67 @@ index 0000000..7a08e59
 +layer (~1 GB), which costs the 32 GB card little and the 12 GB card a lot. The V100 runs without WDDM's per-launch
 +overhead if it is in TCC mode (the Tesla default on Windows), and `--layer-split auto` gives it the layers its
 +cache can hold. `tools/v100_bench.py` measures the reverse order too (`v100_first`), along with the V100 alone.
++
++## Merged onto upstream 0.1.40 (2026-10-06)
++
++The fork started from upstream 0.1.32. On 2026-10-06 it was merged with upstream 0.1.40.1 (666 commits; upstream had
++rewritten its history, so the merge base was set by hand: the fork's base and upstream's `2ca1b66` hold the same
++files). Upstream had meanwhile taken up much of what this fork added, so the merge keeps **upstream's version**
++wherever both did the same thing:
++
++| This fork had | After the merge |
++| --- | --- |
++| V100 fixes in `qsa_prompt_attn.cu` (keep the FP32 kernel) | upstream's Volta tensor-core prompt attention (`mma.m8n8k4`, PR #600) |
++| BF16 GEMM fallback kernel in `prefill/gemm.cu` | upstream's BF16 -> FP16 tensor-core path on 7.x (#655, #540); `bf16_gemm_fallback_test` removed |
++| RAM budget on a layer split, copy back from the owning card | upstream's (the same design: every stage's cache left out of the RAM copy, `resident_stage_swaps` per card) |
++| the adaptive tier without stalls (worker thread, 3 steps) | upstream's `--adapt-async 1` (the same steps, events per card, bounce buffers) - in the config |
++| `--adapt-stage-swaps` (per-card swap budgets) | dropped (more hits, no speed: decode bench 8) |
++| MSVC + CUDA 12: link `cudart_static` | upstream's fix (#585: the shared runtime), and setup's `cuda12` wheels |
++| `setup.py`: Volta admitted by default | upstream's rule: naming the card (`--gpus 0,1`) opts in; the engine is the experimental CUDA 12 one, in `engine-cuda12\` (built in `build-cuda12\`) |
++| MMQ k-quant kernels compiled in, off | not compiled (upstream's default) |
++
++Kept from this fork (upstream has no equivalent):
++
++- **per-card prompt chunks** (`prefill.cpp` gathers hand-offs, `generate.cpp` picks each stage's chunk);
++  `STRATA_SPLIT_STAGE_CHUNKS=0` turns them off;
++- **the RAM copy locked, not page-locked, on a WDDM split** (`FileExpertSource::set_no_pagelock`), and portable
++  exchange buffers;
++- **setup keeps UD-Q4_K_XL's RAM budget on several GPUs** (`budget_split_ok`; `STRATA_BUDGET_SPLIT=0`: upstream's
++  #498 rule, which drops the budget and needs ~135 GB of RAM);
++- the per-request log lines the workload tool reads (prompt path per card, expert reads from the files, PLE I/O);
++- `ple_reader_test --map-only / --touch-mb / --gap-ms`, the `tools/v100_*.py` tools and the `v100\` steps.
++
++`v100_setup.py` now passes `--cuda 12 --no-remote-expert-opt` to setup (`--remote-expert-opt` is for helper caches
++and turns `--adapt-async` off) and adds `--adapt-async 1`. `v100\17_merge_check.bat` builds the merged engine and
++compares decode and prompt speed with the numbers below. The sections after this one describe the fork as it was on
++0.1.32.
++
++### The decode regression after the merge, and its fix (2026-10-06)
++
++The merged engine read prompts faster (a ~116K-token prompt 878 vs 814 tok/s, 60K in 62-63 s vs 67) but wrote
++15-20% slower, unevenly: the CPU took ~40% longer per expert it computed (2.2 -> 3.1-4.7 ms) with the same experts
++to compute. Benches 10 and 11 ran the pre-merge engine and the merged one alternately in one session (so not the PC)
++and turned upstream's newer decode paths off one at a time (none fixed it). The cause: upstream #626 replaced the host
++thread's hard pin (`SetThreadAffinityMask`) with a Windows CPU Set selection, a preference the scheduler may leave -
++and the host drains expert jobs and spins between them, so off its core it competes with the pool's workers (0.1.32's
++own comment measured that at ~35% of the CPU path). The fork pins it hard again (`pool.cpp`;
++`STRATA_HOST_CPUSET=1` = upstream's selection), gives the V100's x4 link no PCIe share again (a link under 4 GB/s;
++`STRATA_STAGE_PCIE_UPSTREAM=1` = upstream's 0.09) and leaves the async tier's copy thread unpinned
++(`STRATA_ADAPT_JOB_CPU=-1` in the config: its default spot is a pool worker's SMT sibling here).
++
++`v100_decodebench12.log` (one session):
++
++| | Short chats | After 60K | ms/window | CPU ms per CPU expert |
++| --- | ---: | ---: | ---: | ---: |
++| pre-merge engine (0.1.32 fork) | 59.2 | 58.1 | 40.8 | 2.21 |
++| **merged + fix** | **66.9** | **63.1** | **37.1** | 2.22 |
++| merged + fix, host on a CPU Set (upstream) | 36.4 | 41.3 | 64.0 | 4.74 |
++| merged + fix, V100 PCIe share 0.09 (upstream) | 66.0 | 61.7 | 37.7 | 2.25 |
++| merged + fix, copy thread on its old spot | 66.3 | 62.8 | 37.6 | 2.26 |
++| pre-merge engine again | 60.6 | 57.3 | 40.7 | 2.22 |
++
++With the host pinned, 0.1.40's decode work (the V100's stage: 12.4 ms of GPU wait per window against 14.0) makes the
++merged engine 9-13% faster than the fork was, on top of its faster prompts.
 +
 +## What changed in the engine
 +
@@ -556,55 +528,48 @@ index 0000000..7a08e59
 +  attention is not yet the limit.
 +- A miss cost for the split search fitted to this CPU, from the bench's numbers.
 diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
-index 2fb6bb9..c2ac8e0 100644
+index 3eda5a0..47449a3 100644
 --- a/include/strata/core/expert_source.hpp
 +++ b/include/strata/core/expert_source.hpp
-@@ -427,6 +427,10 @@ public:
+@@ -479,6 +479,10 @@ public:
          uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
          const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
      void close();
 +    /// V100 fork: never ask the driver to page-lock the RAM copy (`cudaHostAlloc`); it is then ordinary memory
 +    /// locked in the working set.  A layer split under WDDM sets this: tens of GiB mapped into two GPU contexts
-+    /// left WDDM refusing later allocations (the same reason the arena's pinning is capped there).
++    /// left WDDM refusing later allocations, and the locked copy decoded faster there (v100_decodebench3).
 +    void set_no_pagelock(bool v) { no_pagelock_ = v; }
  
      bool mapped() const { return base_ != nullptr; }
      int64_t blobs() const { return blobs_; }
-@@ -453,6 +457,12 @@ public:
-     bool stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q);
-     /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
-     int64_t commit_exchanges();
-+    /// V100 fork: `commit_exchanges` in two halves, so the copy (one blob per swap, ~3 MB each) can run on a worker
-+    /// thread while windows run: `exchange_copy` writes each staged `out` into `in`'s place (nothing reads `in` from
-+    /// here once its slot is resident on the device, and `out` is still read from its exchange buffer), then
-+    /// `exchange_flip` - between windows - points the copy's index at the moved blobs and drops the overrides.
-+    bool exchange_copy();
-+    int64_t exchange_flip();
-     int64_t exchanges() const { return exchanges_; }
-     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
-     /// the SSD).  0 in a steady resident mode; lend-region experts that did not fit the RAM count here.
-@@ -542,6 +552,7 @@ private:
-     int64_t n_expert_ = 0;
-     uint64_t mapped_bytes_ = 0;
-     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
-+    bool no_pagelock_ = false;
-     void* complement_arena_ = nullptr;
-     const uint8_t* complement_host_ = nullptr;
-     const uint8_t* complement_device_ = nullptr;
-@@ -555,7 +566,7 @@ private:
-     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
-     int64_t complement_lent_slots_ = 0;
-     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
--    struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
-+    struct Exchange { size_t in, out; int64_t q; uint64_t bytes; bool copied = false; };
-     std::vector<Exchange> staged_;
-     uint8_t* xstage_ = nullptr;               ///< exchange buffers, `xstage_cap_ x xstage_blob_`
-     bool xstage_pinned_ = false;
+@@ -659,6 +663,7 @@ private:
+     std::vector<uint64_t> complement_offsets_;
+     detail::ExchangeStorage exchange_storage_; // authoritative when active; original arenas still own memory
+     bool complement_pinned_ = false;
++    bool no_pagelock_ = false;                ///< V100 fork: set_no_pagelock
+     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered
+     uint64_t complement_pin_limit_ = 0;
+     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
+diff --git a/include/strata/kernels/cpu/pool.hpp b/include/strata/kernels/cpu/pool.hpp
+index 1b25493..5b2ee19 100644
+--- a/include/strata/kernels/cpu/pool.hpp
++++ b/include/strata/kernels/cpu/pool.hpp
+@@ -120,6 +120,10 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAff
+ struct ThreadAffinity {
+ #if defined(_WIN32)
+     std::vector<unsigned long> cpu_sets;
++    // V100 fork: the hard pin (the default here, as 0.1.32): the previous group affinity, restored as it was
++    bool hard = false;
++    unsigned short prev_group = 0;
++    unsigned long long prev_mask = 0;
+ #else
+     std::vector<unsigned long> mask;
+ #endif
 diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
-index 7ca9879..cc54a7a 100644
+index 037385a..c37fe6c 100644
 --- a/include/strata/prefill/prefill.hpp
 +++ b/include/strata/prefill/prefill.hpp
-@@ -68,6 +68,8 @@ public:
+@@ -71,6 +71,8 @@ public:
      /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
      bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
      int64_t chunk() const;
@@ -614,84 +579,91 @@ index 7ca9879..cc54a7a 100644
      /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
      /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
 diff --git a/setup.py b/setup.py
-index d042d11..8ff0632 100644
+index ee657ce..5644445 100644
 --- a/setup.py
 +++ b/setup.py
-@@ -394,13 +394,19 @@ def experimental_sm60() -> bool:
-     return os.environ.get("STRATA_EXPERIMENTAL_SM60", "").strip() == "1"
+@@ -961,6 +961,14 @@ def unsloth_split_need_gb(model="UD-Q4_K_XL") -> float:
+     return MODELS[model]["download_gb"] + UNSLOTH_RAM_LEFT_GB
  
  
-+def volta_ok(arch) -> bool:
-+    """V100 fork: Volta (sm_70, Tesla V100 / Titan V) is supported here without the env switch (the engine is then
-+    compiled locally with a CUDA 12.x toolkit for sm_70 + the other cards).  STRATA_EXPERIMENTAL_SM60=0 opts out."""
-+    return int(arch) == 70 and os.environ.get("STRATA_EXPERIMENTAL_SM60", "").strip() != "0"
++def budget_split_ok() -> bool:
++    """V100 fork: the engine runs the RAM budget (--resident-budget-gib) on a layer split - the RAM copy holds the
++    hottest experts no GPU holds (generate.cpp: every stage's cache is left out of it), so UD-Q4_K_XL keeps its budget
++    on several GPUs instead of loading every expert into RAM (#498's rule, which needs ~135 GB).  Measured on an
++    RTX 4070 Super + Tesla V100 + 96 GB PC (docs/V100.md).  STRATA_BUDGET_SPLIT=0: upstream's rule."""
++    return os.environ.get("STRATA_BUDGET_SPLIT", "").strip() != "0"
 +
 +
- def sm60_card(arch) -> bool:
-     return 60 <= int(arch) <= 70
- 
- 
- def gpu_problem(g, together=False):
-     """Why Strata cannot use this card, in plain words (None: it can)."""
--    if int(g["arch"]) < 75 and not (sm60_card(g["arch"]) and experimental_sm60()):
-+    if int(g["arch"]) < 75 and not (sm60_card(g["arch"]) and (experimental_sm60() or volta_ok(g["arch"]))):
-         return (f"not supported - older than the RTX 20 series (compute capability {cc(g)}; Strata needs 7.5 or "
-                 "newer" + ("; STRATA_EXPERIMENTAL_SM60=1 tries the community build for it" if sm60_card(g["arch"])
-                           else "") + ")")
-@@ -1425,7 +1431,12 @@ def source_hash(parts) -> str:
- 
- def engine_defs(archs) -> list:
-     """Extra CMake definitions for the engine: the experimental Pascal/Volta build (#295) for cards below sm_75."""
--    return ["-DSTRATA_EXPERIMENTAL_SM60=ON"] if min(int(x) for x in archs) < 75 else []
-+    # V100 fork: a Volta build (the V100 + RTX 4070 Super PC) also gets the MMQ prompt kernels for UD-Q4_K_XL's
-+    # Q4_K / Q5_K / Q5_1 experts (4x less GPU time than dequantize + cuBLAS; with the SSD out of the prompt path the
-+    # GPU time counts).  STRATA_MMQ_KQUANTS=0 in the config's env switches them off at run time.
-+    if min(int(x) for x in archs) < 75:
-+        return ["-DSTRATA_EXPERIMENTAL_SM60=ON"] + (["-DSTRATA_MMQ_KQUANTS=ON"] if 70 in {int(x) for x in archs} else [])
-+    return []
- 
- 
- def prebuilt_vision(meta: dict, gpu: dict, vision: str) -> str:
-@@ -2365,19 +2376,24 @@ def main() -> int:
-     budget = None
-     if MODELS[model].get("budget"):
-         # Unsloth's UD-Q4_K_XL: a RAM budget of experts, the rest from the GGUF on the SSD - not the low-RAM mode (no
--        # experts.bin: it would be another 77 GB on the disk), and one GPU (the budget mode has no layer split)
-+        # experts.bin: it would be another 77 GB on the disk); several GPUs share it by a layer split (V100 fork)
-         warn(f"{model} is EXPERIMENTAL (docs/UNSLOTH_Q4.md): most of its experts are read from the SSD while it "
-              "answers, so it is several times slower than the 2-3-bit models; quality checked against llama.cpp")
-         if ram < MODELS[model]["ram_gb"]:
-             fail(f"{model} needs {MODELS[model]['ram_gb']} GB of RAM or more; this PC has {ram:.0f} GB",
-                  "choose one of the 2-3-bit models")
-         budget = resident_budget_gib(model, ram)
--        ok(f"RAM budget: {budget} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
-+        ok(f"RAM budget: up to {budget} GiB of {model}'s experts in RAM (the ones no GPU holds), the rest read from "
-+           "the model files on the SSD")
-         if a.low_ram not in ("auto", "off"):
-             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
--        if multi:
--            warn(f"{model} runs on one GPU: using " + gpu_name(gpu) + " only")
-+        if multi and os.environ.get("STRATA_BUDGET_ONE_GPU", "").strip() == "1":
-+            warn(f"{model} on one GPU (STRATA_BUDGET_ONE_GPU=1): using " + gpu_name(gpu) + " only")
-             multi, sel, chosen = [], [gpu["index"]], [gpu]
-+        elif multi:
-+            # V100 fork: the engine's RAM-budget mode runs on a layer split (the RAM copy holds what no GPU holds)
+ def split_budget(cfg: dict, yes: bool = False, explicit: bool = False) -> bool:
+     """#498: a UD-Q4_K_XL config (its RAM budget, --resident-budget-gib) started on several GPUs.  The engine refuses
+     the budget with a layer split (it exited with code 2), so the split runs without it - all the experts loaded into
+@@ -968,7 +976,7 @@ def split_budget(cfg: dict, yes: bool = False, explicit: bool = False) -> bool:
+     not a wall - 128 GB ran it fine): a "no" stops, before the config is saved; `explicit` (--gpus) with --yes goes on.
+     True when the config changed."""
+     a = cfg.get("args", [])
+-    if "--resident-budget-gib" not in a:
++    if "--resident-budget-gib" not in a or budget_split_ok():   # V100 fork: the budget stays on a split
+         return False
+     model = budget_model(cfg)
+     need, ram = unsloth_split_need_gb(model), ram_gb()
+@@ -1020,7 +1028,7 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
+         return cfg
+     # #498: UD-Q4_K_XL's RAM budget has no layer split; without it the RAM must hold the GGUFs and 24 GB more
+     budget = "--resident-budget-gib" in cfg.get("args", [])
+-    if budget and ram_gb() < unsloth_split_need_gb(budget_model(cfg)):
++    if budget and not budget_split_ok() and ram_gb() < unsloth_split_need_gb(budget_model(cfg)):
+         return cfg
+     pair = can[:2]
+     cfg["gpus_asked"] = True
+@@ -1034,7 +1042,10 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
+         say("  This model runs in the low-RAM mode with its experts kept in RAM, on one GPU (recommended: steady RAM")
+         say("  use). On both, the experts the GPUs do not hold are read through the OS file cache instead: faster in")
+         say("  two reports (#364, #384), but RAM can fill up to 0 free during long prompts.")
+-    if budget:
++    if budget and budget_split_ok():   # V100 fork: the budget stays on a split
++        say(f"  This model ({budget_model(cfg)}) keeps its RAM budget on both: each card's expert cache is left out of")
++        say("  it, so the RAM holds the most-used experts no GPU holds (docs/V100.md).")
++    elif budget:
+         say(f"  This model ({budget_model(cfg)}) runs on one GPU with a RAM budget of its experts (recommended: the tested")
+         say("  setup). On both it has no budget: all its experts are loaded into RAM at start, which this PC's RAM")
+         say("  holds - about twice as fast in #498 (2x RTX 3090: 31 -> 64-78 tokens/s).")
+@@ -1047,7 +1058,7 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
+         say("  The installed engine has no code for " + ", ".join(g["name"] for g in missing) + ": to use them "
+             "together, run START-HERE.bat --setup --gpus " + ",".join(str(g["index"]) for g in pair))
+     elif ask("  Use both from now on? (you can change it later: START-HERE.bat --gpu N for one card)",
+-             ["y", "n"], "n" if resident or short or budget else "y", yes) == "y":
++             ["y", "n"], "n" if resident or short or (budget and not budget_split_ok()) else "y", yes) == "y":
+         cfg["gpu"] = [g["index"] for g in pair]
+         cfg["layer_split"] = cfg.get("layer_split") or "auto"
+         split_mmap(cfg)
+@@ -4446,9 +4457,13 @@ def main() -> int:
+                          "install it anyway", "  Install it anyway?")
+             warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
+         budget = budget_choice(model, ram, a.resident_budget_gib)
+-        if multi and not unsloth_together(a, model, ram, gpu, chosen):
++        if multi and budget_split_ok():
++            # V100 fork: the RAM budget on a layer split (budget_split_ok); every GPU's expert cache is left out of it
 +            ok(f"{model} shares its layers across " + " + ".join(gpu_name(x) for x in chosen) +
-+               ": every GPU's expert cache comes out of the RAM budget's work")
-     low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
-                                   (a.low_ram == "auto" and low_ram_needed(model, ram)))
-     if low_ram and multi:
++               ": the RAM budget holds the most-used experts no GPU holds")
++        elif multi and not unsloth_together(a, model, ram, gpu, chosen):
+             multi, sel, chosen = [], [gpu["index"]], [gpu]
+-        q4_split = bool(multi)                         # #498: on several GPUs without the RAM budget
++        q4_split = bool(multi) and not budget_split_ok()   # #498: on several GPUs without the RAM budget
+         if not q4_split:
+             ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
+         if a.low_ram not in ("auto", "off"):
 diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
-index 32d6408..d335692 100644
+index d0ff201..868ab30 100644
 --- a/src/core/expert_source.cpp
 +++ b/src/core/expert_source.cpp
-@@ -1119,9 +1119,11 @@ bool FileExpertSource::pin_cache_complement(
+@@ -1810,10 +1810,12 @@ bool FileExpertSource::pin_cache_complement(
      };
      if (bytes > 0) {
          std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
 -                     (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
 +                     (double) bytes / 1073741824.0,
 +                     pin && !no_pagelock_ ? "page-locked" : pin ? "locked resident" : "pageable resident");
+         log_complement_memory("before complement allocation", bytes);
          std::fflush(stderr);
 -        if (pin) {
 +        if (pin && no_pagelock_) note = "page-locking skipped (a layer split under WDDM)";
@@ -699,85 +671,68 @@ index 32d6408..d335692 100644
              const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
                                                           cudaHostAllocMapped | cudaHostAllocPortable);
              if (allocated == cudaSuccess) {
-@@ -1344,7 +1346,8 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
-     }
+@@ -2100,7 +2102,9 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
+                           complement_host_ && complement_device_ && complement_bytes_ > 0;
      const size_t total = (size_t) n * (size_t) blob;
      void* p = nullptr;
--    if (cudaHostAlloc(&p, total, cudaHostAllocDefault) == cudaSuccess && p != nullptr) {
+-    if (cudaHostAlloc(&p, total, eligible ? cudaHostAllocMapped : cudaHostAllocDefault) == cudaSuccess && p != nullptr) {
 +    // Portable: a layer split copies evicted experts back from the later stages' GPUs into these too (V100 fork)
-+    if (cudaHostAlloc(&p, total, cudaHostAllocPortable) == cudaSuccess && p != nullptr) {
++    if (cudaHostAlloc(&p, total, (eligible ? cudaHostAllocMapped : cudaHostAllocDefault) | cudaHostAllocPortable) ==
++            cudaSuccess && p != nullptr) {
          xstage_pinned_ = true;
      } else {
          (void) cudaGetLastError();
-@@ -1376,6 +1379,28 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
-     return true;
- }
- 
-+bool FileExpertSource::exchange_copy() {
-+    for (Exchange& x : staged_) {
-+        const uint8_t* src = override_.empty() ? nullptr : override_[x.out];
-+        const uint64_t at = complement_offsets_[x.in];
-+        x.copied = src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
-+                   complement_host_ != nullptr;
-+        if (x.copied) std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
+diff --git a/src/kernels/cpu/pool.cpp b/src/kernels/cpu/pool.cpp
+index 69411ee..0cc57d3 100644
+--- a/src/kernels/cpu/pool.cpp
++++ b/src/kernels/cpu/pool.cpp
+@@ -362,6 +362,29 @@ ThreadAffinity pin_current_thread(int core) {
+     if (core < 0) return {};
+ #if defined(_WIN32)
+     ThreadAffinity previous;
++    // V100 fork: the host thread is HARD-pinned to its core, as 0.1.32 did (SetThreadAffinityMask).  0.1.40's CPU
++    // Set selection (#626) is a preference the scheduler may leave: on a hybrid i5-13600K the host - which drains
++    // expert jobs and spins between them - then also ran beside the pool's workers, and the CPU path took ~40% longer
++    // per expert, run to run uneven (v100_decodebench10/11: 2.2 -> 3.1-4.1 ms per CPU expert, decode 59 -> 45-52
++    // tok/s).  STRATA_HOST_CPUSET=1 keeps upstream's CPU Set selection.
++    static const bool cpuset = [] {
++        const char* v = std::getenv("STRATA_HOST_CPUSET");
++        return v != nullptr && v[0] == '1';
++    }();
++    if (!cpuset) {
++        GROUP_AFFINITY target{}, prev{};
++        target.Group = (WORD) (core / 64);
++        target.Mask = KAFFINITY(1) << (core & 63);
++        if (SetThreadGroupAffinity(GetCurrentThread(), &target, &prev)) {
++            previous.hard = true;
++            previous.prev_group = prev.Group;
++            previous.prev_mask = (unsigned long long) prev.Mask;
++            previous.valid = true;
++            return previous;
++        }
++        std::fprintf(stderr, "strata cpu pool: host affinity for processor %d failed: %lu; trying a CPU Set\n", core,
++                     (unsigned long) GetLastError());
 +    }
-+    return true;
-+}
-+
-+int64_t FileExpertSource::exchange_flip() {
-+    int64_t n = 0;
-+    for (const Exchange& x : staged_) {
-+        if (x.copied && detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
-+        override_[x.out] = nullptr;
+     ULONG target = 0;
+     if (!detail::get_thread_cpu_sets(previous.cpu_sets) || !detail::cpu_set_for_core(core, target) ||
+         !SetThreadSelectedCpuSets(GetCurrentThread(), &target, 1)) {
+@@ -387,6 +410,14 @@ ThreadAffinity pin_current_thread(int core) {
+ void restore_thread_affinity(const ThreadAffinity& previous) {
+     if (!previous.valid) return;
+ #if defined(_WIN32)
++    if (previous.hard) {   // V100 fork: the hard pin's previous group affinity
++        GROUP_AFFINITY prev{};
++        prev.Group = (WORD) previous.prev_group;
++        prev.Mask = (KAFFINITY) previous.prev_mask;
++        if (prev.Mask == 0 || !SetThreadGroupAffinity(GetCurrentThread(), &prev, nullptr))
++            std::fprintf(stderr, "strata cpu pool: host affinity restoration failed: %lu\n", (unsigned long) GetLastError());
++        return;
 +    }
-+    staged_.clear();
-+    exchanges_ += n;
-+    return n;
-+}
-+
- int64_t FileExpertSource::commit_exchanges() {
-     int64_t n = 0;
-     for (const Exchange& x : staged_) {
-diff --git a/src/kernels/cuda/qsa_prompt_attn.cu b/src/kernels/cuda/qsa_prompt_attn.cu
-index e5f85bf..45b6564 100644
---- a/src/kernels/cuda/qsa_prompt_attn.cu
-+++ b/src/kernels/cuda/qsa_prompt_attn.cu
-@@ -979,21 +979,26 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
-     {   // sm_75 or newer: the MMA above compiles for both.  sm_80+ runs the cp.async kernel (launch_i8); Turing has
-         // no cp.async, so it runs the v1 kernel (launch<1>, same accuracy, another summation order).  An older card
-         // keeps the old kernel.
--        static int cc_major[64] = {};
-+        // V100 fix: the cache holds 10 * major + minor, not the major alone.  Volta (sm_70) is major 7 like Turing,
-+        // but its mma16816 is compiled to __trap() (no m16n8k8 before sm_75), so it must keep the old kernel.
-+        static int cc[64] = {};
-         int dev = 0;
-         if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
--        if (cc_major[dev] == 0) {
--            int major = 0;
--            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
-+        if (cc[dev] == 0) {
-+            int major = 0, minor = 0;
-+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
-+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
-                 cudaGetLastError();
-                 return false;
-             }
-+            const int real = 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);
-             // STRATA_QSA_WARP=1|attn (an A/B arm): the pre-sm_80 kernels on any card, as RTX 20 runs them
-+            // (a Volta card stays Volta: it has no kernel to run here)
-             const char* w = std::getenv("STRATA_QSA_WARP");
--            cc_major[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "attn")) ? 7 : strata::cc_major_of(major);
-+            cc[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "attn")) && real >= 75 ? 75 : real;
-         }
--        if (cc_major[dev] < 7) return false;
--        turing = cc_major[dev] < 8;
-+        if (cc[dev] < 75) return false;
-+        turing = cc[dev] < 80;
-     }
- #if defined(__HIPCC__)
-     // the tensor-core kernels are compiled out on AMD (its major version is not a CUDA sm); RDNA4 has its own int8-KV
+     // Clearing an originally empty selection restores process-default/all-group eligibility without
+     // turning the caller's implicit Windows 11 affinity into an explicit single-group hard mask.
+     if (!SetThreadSelectedCpuSets(GetCurrentThread(), previous.cpu_sets.empty() ? nullptr : previous.cpu_sets.data(),
 diff --git a/src/ngram/ple_reader_test.cpp b/src/ngram/ple_reader_test.cpp
-index 9322dc1..98fe609 100644
+index 9208470..84a1b11 100644
 --- a/src/ngram/ple_reader_test.cpp
 +++ b/src/ngram/ple_reader_test.cpp
 @@ -3,9 +3,15 @@
@@ -806,7 +761,7 @@ index 9322dc1..98fe609 100644
  #include <fstream>
  #include <random>
  #include <sstream>
-@@ -193,8 +201,27 @@ int selftest(const std::string& dir) {
+@@ -360,8 +368,27 @@ int selftest(const std::string& dir, uint32_t rb) {
  }
  
  int real(const std::string& gguf, int n_random, const std::string& tokens_path, uint32_t inflight, bool direct_first,
@@ -835,7 +790,7 @@ index 9322dc1..98fe609 100644
      std::string err;
      k::PleIoOptions mo;
      mo.mode = k::PleIo::Mmap;
-@@ -230,7 +257,10 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path,
+@@ -397,7 +424,10 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path,
      }
      std::vector<float> a(k::NG_N_EMBD), b(k::NG_N_EMBD);
      double t_mm = 0, t_dir = 0, t_issue = 0;
@@ -846,7 +801,7 @@ index 9322dc1..98fe609 100644
          for (int pass = 0; pass < 2; ++pass) {
              const bool do_direct = (pass == 0) == direct_first;
              const double t0 = now_us();
-@@ -249,9 +279,15 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path,
+@@ -416,9 +446,15 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path,
                  t_dir += now_us() - t0;
              }
          }
@@ -862,16 +817,16 @@ index 9322dc1..98fe609 100644
      std::printf("tokens %zu: mmap %.1f us/token, direct %.1f us/token (issue on this thread %.1f us)\n%s\n",
                  tickets.size(), t_mm / (double) tickets.size(), t_dir / (double) tickets.size(),
                  t_issue / (double) tickets.size(), direct.io_report().c_str());
-@@ -269,6 +305,8 @@ int main(int argc, char** argv) {
+@@ -436,6 +472,8 @@ int main(int argc, char** argv) {
      bool direct_only = false;
      bool sync_submit = false;
      bool self = false;
 +    bool map_only = false;
 +    int touch_mb = 0, gap_ms = 0;
+     std::string make_path, make_fmt, ram_path;   // --make-table PATH FORMAT (uses --rows), --ram-time PATH
      for (int i = 1; i < argc; ++i) {
          const std::string a = argv[i];
-         if (a == "--selftest") self = true;
-@@ -280,10 +318,14 @@ int main(int argc, char** argv) {
+@@ -450,6 +488,9 @@ int main(int argc, char** argv) {
          else if (a == "--direct-first") direct_first = true;
          else if (a == "--direct-only") direct_only = true;
          else if (a == "--sync") sync_submit = true;
@@ -880,165 +835,22 @@ index 9322dc1..98fe609 100644
 +        else if (a == "--gap-ms" && i + 1 < argc) gap_ms = std::atoi(argv[++i]);
          else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
      }
-     if (self) return selftest(dir);
+     if (self) {
+@@ -487,7 +528,8 @@ int main(int argc, char** argv) {
+                     (now_us() - t0) / 1e6);
+         return ok ? 0 : 1;
+     }
 -    if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit);
 +    if (!gguf.empty())
 +        return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit, map_only, touch_mb, gap_ms);
      std::fprintf(stderr, "nothing to do\n");
      return 2;
  }
-diff --git a/src/prefill/gemm.cu b/src/prefill/gemm.cu
-index cfa966a..d156e59 100644
---- a/src/prefill/gemm.cu
-+++ b/src/prefill/gemm.cu
-@@ -35,6 +35,75 @@
- namespace strata::prefill {
- namespace {
- 
-+#if !defined(__HIPCC__)
-+// ---- V100 (sm_70) support: a BF16 x BF16 -> FP32 GEMM that needs no BF16 hardware ---------------------------------
-+// cuBLAS's BF16 GemmEx is an Ampere-and-newer feature on some toolkits; Volta (and Pascal) may answer
-+// CUBLAS_STATUS_NOT_SUPPORTED / ARCH_MISMATCH instead of a product.  BF16 -> FP32 is exact (a 16-bit shift), so this
-+// kernel computes the same sum as an FP32 GEMM on the widened inputs, with FP32 accumulation: Y[t, n] = beta*Y[t, n]
-+// + sum_k X[t, k] W[n, k].  64 x 64 output tile per block, 256 threads, 4 x 4 outputs per thread, K in steps of 16.
-+// Only the prompt path's dense BF16 projections reach it (a small share of a chunk's time), never the decode.
-+constexpr int kBfTile = 64, kBfK = 16;
-+__global__ void __launch_bounds__(256) bf16_gemm_fallback_kernel(const uint16_t* __restrict__ X,
-+                                                                  const uint16_t* __restrict__ W, float* __restrict__ Y,
-+                                                                  int T, int N, int K, int ldy, float beta) {
-+    __shared__ float xs[kBfK][kBfTile + 1];
-+    __shared__ float ws[kBfK][kBfTile + 1];
-+    const int tid = threadIdx.x;
-+    const int t0 = blockIdx.y * kBfTile, n0 = blockIdx.x * kBfTile;
-+    const int tr = (tid / 16) * 4, nc = (tid % 16) * 4;   // this thread's 4 x 4 outputs
-+    float acc[4][4] = {};
-+    for (int k0 = 0; k0 < K; k0 += kBfK) {
-+        // 64 rows x 16 k of X and of W: 1024 values each, 4 per thread
-+#pragma unroll
-+        for (int i = 0; i < 4; ++i) {
-+            const int e = tid + i * 256;
-+            const int r = e / kBfK, kk = e % kBfK;
-+            const int k = k0 + kk;
-+            const int t = t0 + r, n = n0 + r;
-+            xs[kk][r] = (t < T && k < K) ? __uint_as_float((uint32_t) X[(int64_t) t * K + k] << 16) : 0.0f;
-+            ws[kk][r] = (n < N && k < K) ? __uint_as_float((uint32_t) W[(int64_t) n * K + k] << 16) : 0.0f;
-+        }
-+        __syncthreads();
-+#pragma unroll
-+        for (int kk = 0; kk < kBfK; ++kk) {
-+            float a[4], b[4];
-+#pragma unroll
-+            for (int i = 0; i < 4; ++i) { a[i] = xs[kk][tr + i]; b[i] = ws[kk][nc + i]; }
-+#pragma unroll
-+            for (int i = 0; i < 4; ++i)
-+#pragma unroll
-+                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
-+        }
-+        __syncthreads();
-+    }
-+#pragma unroll
-+    for (int i = 0; i < 4; ++i) {
-+        const int t = t0 + tr + i;
-+        if (t >= T) continue;
-+#pragma unroll
-+        for (int j = 0; j < 4; ++j) {
-+            const int n = n0 + nc + j;
-+            if (n >= N) continue;
-+            float* y = Y + (int64_t) t * ldy + n;
-+            *y = beta != 0.0f ? fmaf(beta, *y, acc[i][j]) : acc[i][j];
-+        }
-+    }
-+}
-+
-+// Per device: does cuBLAS run BF16 GemmEx here?  1 yes, 0 no (use the kernel above), -1 not asked yet.
-+// STRATA_BF16_GEMM_FALLBACK=1 forces the kernel on any card (the parity arm), =0 forbids it.
-+int g_bf16_cublas[64] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-+                         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-+                         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
-+int bf16_fallback_env() {
-+    static const int v = [] {
-+        const char* e = std::getenv("STRATA_BF16_GEMM_FALLBACK");
-+        return e && *e ? std::atoi(e) : -1;
-+    }();
-+    return v;
-+}
-+#endif
-+
- void ck(cublasStatus_t s, const char* what) {
-     if (s != CUBLAS_STATUS_SUCCESS) {
-         std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d\n", what, (int) s);
-@@ -365,12 +434,41 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
-                       beta, stream_)) {
-         return;
-     }
-+#endif
-+#if !defined(__HIPCC__)
-+    int dev = 0;
-+    cudaGetDevice(&dev);
-+    int* known = (dev >= 0 && dev < 64) ? &g_bf16_cublas[dev] : nullptr;
-+    const int env = bf16_fallback_env();
-+    if (env == 1 || (env != 0 && known && *known == 0)) {
-+        const dim3 grid((unsigned) ((N + kBfTile - 1) / kBfTile), (unsigned) ((T + kBfTile - 1) / kBfTile));
-+        bf16_gemm_fallback_kernel<<<grid, 256, 0, (cudaStream_t) stream_>>>(X, W, Y, (int) T, (int) N, (int) K,
-+                                                                            (int) ldy, beta);
-+        if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) {
-+            std::fprintf(stderr, "prefill gemm: bf16 fallback kernel: %s\n", cudaGetErrorString(e));
-+            std::exit(1);
-+        }
-+        return;
-+    }
- #endif
-     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
--    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
--                    CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
--                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
--       "cublasGemmEx");
-+    const cublasStatus_t st = cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T,
-+                                           (int) K, &alpha, W, CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta,
-+                                           Y, CUDA_R_32F, (int) ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-+#if !defined(__HIPCC__)
-+    if (st != CUBLAS_STATUS_SUCCESS && known && *known != 1 && env != 0 &&
-+        (st == CUBLAS_STATUS_NOT_SUPPORTED || st == CUBLAS_STATUS_ARCH_MISMATCH)) {
-+        // Volta / Pascal: no BF16 GemmEx in this cuBLAS - the kernel above from now on, for this device.  The call
-+        // was rejected before anything ran, so Y is untouched and the same product is simply made by the kernel.
-+        std::fprintf(stderr, "prefill gemm: device %d: cuBLAS has no BF16 GEMM here (status %d); using the FP32 "
-+                             "fallback kernel for the BF16 projections\n", dev, (int) st);
-+        *known = 0;
-+        bf16(X, W, Y, T, N, K, ldy, beta);
-+        return;
-+    }
-+    if (st == CUBLAS_STATUS_SUCCESS && known && *known < 0) *known = 1;
-+#endif
-+    ck(st, "cublasGemmEx");
- }
- 
- void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
-diff --git a/src/prefill/moe_mmq.cu b/src/prefill/moe_mmq.cu
-index 3566907..a75c91d 100644
---- a/src/prefill/moe_mmq.cu
-+++ b/src/prefill/moe_mmq.cu
-@@ -90,6 +90,16 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
- bool built() { return true; }
- 
- bool supported(int t) {
-+#ifdef STRATA_MMQ_KQUANTS
-+    // V100 fork: OFF unless STRATA_MMQ_KQUANTS=1.  prefill_mmq_kquant_test left output rows unwritten on both the V100
-+    // and the RTX 4070 Super (2026-10-02, its second batch), so the Q4_K / Q5_K / Q5_1 experts take the FP16 dequantize
-+    // + cuBLAS path (measured ~10% slower prompts, known correct) until that is understood.
-+    static const bool kq_off = [] {
-+        const char* v = std::getenv("STRATA_MMQ_KQUANTS");
-+        return v == nullptr || v[0] != '1';
-+    }();
-+    if (kq_off && (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q5_1)) return false;
-+#endif
-     switch ((ggml_type) t) {
-         case GGML_TYPE_Q2_0:
- #ifdef STRATA_ORCA_Q4KS_MMQ
 diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
-index 4bca216..c1fb767 100644
+index 7b53ac9..89cd915 100644
 --- a/src/prefill/prefill.cpp
 +++ b/src/prefill/prefill.cpp
-@@ -361,6 +361,7 @@ struct Prefill::Impl {
+@@ -619,6 +619,7 @@ struct Prefill::Impl {
      // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
      int device = -1;
      float* hand[2] = {};
@@ -1046,7 +858,7 @@ index 4bca216..c1fb767 100644
      // C-4: the chunk's token ids on the device, for one batched embedding gather
      int32_t* tok_dev = nullptr;
      std::vector<int32_t> tok_host;
-@@ -524,9 +525,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
+@@ -826,9 +827,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
          return false;
      }
      for (int b = 0; next_ != nullptr && b < 2; ++b)
@@ -1062,7 +874,7 @@ index 4bca216..c1fb767 100644
          }
      if (m.tok_dev == nullptr) {
          if (const cudaError_t e = cudaMalloc((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t)); e != cudaSuccess) {
-@@ -731,6 +735,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
+@@ -1068,6 +1072,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
  }
  
  int64_t Prefill::chunk() const { return impl_->T; }
@@ -1070,21 +882,21 @@ index 4bca216..c1fb767 100644
  
  bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                         std::string& err) {
-@@ -1002,6 +1007,36 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
-     std::string next_err;
-     std::future<bool> next_run;
-     int hand_buf = 0;
+@@ -1687,6 +1692,36 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+     const int64_t LB = stage_lb_, LE = stage_le_;
+     // The direct successor's future lives on the Prefill object. Intermediate
+     // stages therefore do not drain the complete remaining GPU chain here.
 +    // V100 fork: PER-STAGE CHUNKS.  The next stage may read in bigger chunks than this one (a card with a bigger
 +    // expert cache can lend a bigger chunk's buffers): this stage's chunks are gathered in the hand-off buffer and
 +    // handed on together, up to the next stage's chunk.  Each layer is causal in the positions, so a stage reading
 +    // [a, b) and then [b, c) leaves the same state as one reading [a, c); only the expert stream changes - the next
-+    // stage streams its non-resident experts once per ITS chunk.  The buffers grow here (between prompts: no
-+    // hand-off is in flight); if the bigger ones cannot be pinned, the old size is kept and the hand-offs are smaller.
-+    int64_t hand_cap = 0;   // rows per hand-off
-+    int64_t acc0 = 0, acc_n = 0;   // the gathered rows: this run's offset and count
++    // stage streams its non-resident experts once per ITS chunk.  The buffers grow here, only while no hand-off is in
++    // flight; if the bigger ones cannot be pinned, the old size is kept and the hand-offs are smaller.
++    int64_t hand_cap = 0;            // rows per hand-off
++    int64_t acc_n = 0, acc_c0 = 0, acc_p0 = 0;   // the gathered rows: count, and the first one's offset and position
 +    if (next_ != nullptr) {
 +        const int64_t want = std::max(m.T, next_->impl_->T);
-+        if (want > m.hand_rows) {
++        if (want > m.hand_rows && !next_run_.valid()) {
 +            float* nh[2] = {};
 +            bool got = true;
 +            for (int b = 0; b < 2 && got; ++b)
@@ -1107,43 +919,45 @@ index 4bca216..c1fb767 100644
      double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
      strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
      s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
-@@ -1864,21 +1899,30 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
+@@ -3219,13 +3254,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
          core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
          pt.mark(kPfStart, cs);
          if (next_ != nullptr) {
--            // the rows to the host buffer the next stage read two chunks ago (it has finished: waited below)
-+            // the rows to the host buffer the next stage read two hand-offs ago (it has finished: waited below),
-+            // after the rows of this stage's earlier chunks gathered for the same hand-off
-             float* h = m.hand[hand_buf];
+-            // The current hand-off slot was used two chunks ago.
++            // The current hand-off slot was used two hand-offs ago; this stage's earlier chunks gathered for the
++            // same hand-off are in it already (V100 fork)
+             float* h = m.hand[hand_buf_];
 -            if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
-+            if (acc_n == 0) acc0 = c0;
-+            if (cudaMemcpyAsync(h + (size_t) acc_n * D, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
++            if (acc_n == 0) { acc_c0 = c0; acc_p0 = p0; }
++            if (cudaMemcpyAsync(h + (size_t) acc_n * D, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) !=
++                    cudaSuccess ||
                  cudaStreamSynchronize(m.cs) != cudaSuccess) {
                  err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                  return false;
              }
--            // this stage's state is at the chunk's end now (synced) and moves on with the next chunk below
 +            acc_n += T;
 +            // gather the next chunk too when it still fits the next stage's chunk
-+            const int64_t c_next = c0 + T;
-+            if (c_next < n && acc_n + std::min(m.T, n - c_next) <= hand_cap) continue;
-+            // this stage's state is at the hand-off's end now (synced) and moves on with the next chunk below.
-+            // Only here: the next stage reports (and saves its checkpoint part) at hand-off boundaries, so a part
++            if (c0 + T < n && acc_n + std::min(m.T, n - (c0 + T)) <= hand_cap) continue;
++            // Only at hand-off boundaries: the next stage reports (and saves its checkpoint part) there, so a part
 +            // saved between them would never be completed.
+             // Wait only for the DIRECT successor's previous chunk. That successor
+             // may already have forwarded its older chunk to later GPUs.
              if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
-             if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
+@@ -3233,10 +3276,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+             next_err_.clear();
              next_->hand_in_ = h;
--            next_run = std::async(std::launch::async, [this, tokens, c0, T, p0, &next_err] {
--                return next_->run(tokens + c0, T, p0, next_err);
-+            next_run = std::async(std::launch::async, [this, tokens, a0 = acc0, an = acc_n, ap = pos0 + acc0, &next_err] {
-+                return next_->run(tokens + a0, an, ap, next_err);
+             next_->single_chunk_ = single_chunk;
+-            next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
+-                return next_->run_impl(tokens + c0, T, p0, next_err_);
++            next_run_ = std::async(std::launch::async, [this, tokens, a0 = acc_c0, an = acc_n, ap = acc_p0] {
++                return next_->run_impl(tokens + a0, an, ap, next_err_);
              });
-             hand_buf ^= 1;
+             hand_buf_ ^= 1;
 +            acc_n = 0;
              continue;   // the last stage reports the chunk (on_chunk)
          }
          if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
-@@ -1949,8 +1993,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
+@@ -3338,8 +3382,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
              std::snprintf(b, sizeof b, " %s %.0f (%.1f%%)", kPfNames[i], pt.ms[i], total > 0 ? 100.0 * pt.ms[i] / total : 0.0);
              line += b;
          }
@@ -1157,202 +971,52 @@ index 4bca216..c1fb767 100644
                               "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                               "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
 diff --git a/src/program/generate.cpp b/src/program/generate.cpp
-index 1a2f203..bcdf3a8 100644
+index 3b551f3..5376366 100644
 --- a/src/program/generate.cpp
 +++ b/src/program/generate.cpp
-@@ -93,6 +93,7 @@
- #include <cstring>
- #include <filesystem>
- #include <fstream>
-+#include <future>
- #include <sstream>
- #include <string>
- #include <set>
-@@ -126,14 +127,22 @@ using Clock = std::chrono::steady_clock;
- // reads the file.  Swaps that need no exchange (`out` in the lend region is held in RAM already; or `in` is not) go
- // on as before; ones beyond the buffers' room wait for a later round.  Runs on the adaptive tier's thread while the
- // GPU commits and drafts: the copies back are on its stream, and waited for before the refills are queued.
--template <class Swap>
--bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::ExpertCache& cache,
--                          const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
--                          cudaStream_t stream) {
-+// V100 + layer split: `owner(layer)` names the cache that holds the layer's slots, its device and the stream to copy
-+// on (a layer split's later stages own their layers' slots; the slot numbers in `host_res` index THAT cache).  The
-+// one-GPU call keeps CUDA0's cache, device -1 (the current one) and `stream`.
-+struct SwapOwner {
-+    strata::core::ExpertCache* cache = nullptr;
-+    int dev = -1;
-+    cudaStream_t stream = nullptr;
-+};
-+template <class Swap, class Owner>
-+bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res,
-+                          int64_t n_expert, std::vector<Swap>& swaps, Owner&& owner) {
-     if (!src.complement_ready() || swaps.empty()) return true;
-     struct Staged { int32_t layer, in, out; int64_t q; };
-     std::vector<Staged> staged;
-     std::vector<Swap> kept;
-+    std::vector<SwapOwner> used;   // every stream a copy went on, synchronized below
-     kept.reserve(swaps.size());
-     for (const Swap& s : swaps) {
-         if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
-@@ -141,21 +150,37 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::Exp
-         if (q >= src.exchange_capacity()) continue;
-         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
-         if (slot < 0) continue;
--        if (cudaMemcpyAsync(src.exchange_buffer(q), cache.device_slot(slot),
-+        const SwapOwner w = owner(s.layer);
-+        if (w.cache == nullptr) continue;
-+        const strata::core::OnDevice on(w.dev);
-+        if (cudaMemcpyAsync(src.exchange_buffer(q), w.cache->device_slot(slot),
-                             (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), cudaMemcpyDeviceToHost,
--                            stream) != cudaSuccess)
-+                            w.stream) != cudaSuccess)
-             return false;
-+        bool seen = false;
-+        for (const SwapOwner& u : used) seen = seen || (u.dev == w.dev && u.stream == w.stream);
-+        if (!seen) used.push_back(w);
-         staged.push_back({s.layer, s.in, s.out, q});
-         kept.push_back(s);
-     }
-     if (!staged.empty()) {
--        if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
-+        for (const SwapOwner& u : used) {
-+            const strata::core::OnDevice on(u.dev);
-+            if (cudaStreamSynchronize(u.stream) != cudaSuccess) return false;
-+        }
-         for (const Staged& x : staged)
-             if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) return false;
-     }
-     swaps.swap(kept);
-     return true;
- }
-+template <class Swap>
-+bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::ExpertCache& cache,
-+                          const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
-+                          cudaStream_t stream) {
-+    return resident_stage_swaps(src, host_res, n_expert, swaps,
-+                                [&](int32_t) { return SwapOwner{&cache, -1, stream}; });
-+}
- 
- struct Options {
-     std::string pack = "pack/full";
-@@ -378,6 +403,11 @@ struct Options {
-     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
-     bool vision = false;
-     int adapt_swaps = 96;
-+    /// V100 fork: --adapt-stage-swaps N0,N1,..: the swap budget of each card of a layer split (CUDA0's layers first),
-+    /// in place of the one --adapt-swaps budget the cards shared.  The 4070 Super's layers miss the most (its cache
-+    /// holds ~17% of their experts, the V100's ~58%) and its swaps cross a x16 link; the V100's cross a x4 link that
-+    /// decode also uses.  Empty: --adapt-swaps for all of them together, as before.
-+    std::vector<int> adapt_stage_swaps;
-     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
-     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
-     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
-@@ -499,6 +529,8 @@ void usage() {
-                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
-                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
-                  "                       of the batched prompt path (default 64, 0 = off)\n"
-+                 "  --adapt-stage-swaps N0,N1  --serve, layer split: each card's adaptive swap budget per round (CUDA0's\n"
-+                 "                       layers first) instead of --adapt-swaps shared by all of them\n"
-                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
-                  "                       when it pays (default 3; 0 = MTP only)\n"
-                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
-@@ -1205,6 +1237,16 @@ int main(int argc, char** argv) {
-             o.stop_eos = true;
+@@ -2997,6 +2997,14 @@ int main(int argc, char** argv) {
+             std::string bursts;
+             const double bw = probe_pcie_h2d_gbps(&bursts);
+             if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
++            // V100 fork: a link under 4 GB/s (the V100's PCIe 3.0 x4) takes no share, as in 0.1.32: 0.1.40 gives it
++            // 0.09, and its stage's CPU and GPU time both rose (v100_decodebench11, pcie0).  STRATA_STAGE_PCIE_UPSTREAM=1
++            // keeps 0.1.40's rule.
++            static const bool stage_pcie_upstream = [] {
++                const char* v = std::getenv("STRATA_STAGE_PCIE_UPSTREAM");
++                return v != nullptr && v[0] == '1';
++            }();
++            if (bw > 0.0 && bw < 4.0 && !stage_pcie_upstream) st.pcie_frac = 0.0;
+             std::fprintf(stderr, "strata generate: layer split: CUDA%d PCIe probe %.1f GB/s (best of %s) -> pcie_frac "
+                                  "%.2f\n", st.dev, bw, bursts.c_str(), st.pcie_frac);
          }
-         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
-+        else if (a == "--adapt-stage-swaps") {
-+            std::vector<int64_t> v;
-+            std::string e;
-+            if (!parse_i64_list(next("--adapt-stage-swaps"), v, e)) {
-+                std::fprintf(stderr, "--adapt-stage-swaps: %s\n", e.c_str());
-+                return 2;
-+            }
-+            o.adapt_stage_swaps.clear();
-+            for (const int64_t x : v) o.adapt_stage_swaps.push_back((int) std::max<int64_t>(0, std::min<int64_t>(x, 512)));
-+        }
-         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
-         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
-         else if (a == "--no-hit-poke") o.no_hit_poke = true;
-@@ -1320,10 +1362,15 @@ int main(int argc, char** argv) {
-         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
-         return 2;
-     }
-+    // V100 support: the RAM-budget mode (--resident-budget-gib, Unsloth's UD-Q4_K_XL) runs on a layer split - the
-+    // RAM copy then holds what NO stage's cache holds (every stage's pairs are passed to the complement planner).
-+    // The plain resident mode (--resident-experts, with its prompt-path lend region) and the helper caches stay
-+    // one-GPU: the lend region is CUDA0's alone.
-     if (o.resident_cpu_experts &&
--        (!o.layer_split.empty() || o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
--         o.expert_cache_remote[2] > 0)) {
--        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
-+        ((!o.layer_split.empty() && o.resident_budget == 0) || o.expert_cache_remote[0] > 0 ||
-+         o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)) {
-+        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits (except with "
-+                             "--resident-budget-gib) or remote expert caches\n");
-         return 2;
-     }
-     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
-@@ -2408,7 +2455,11 @@ int main(int argc, char** argv) {
-         while (st < (int) split_at.size() && l >= split_at[(size_t) st]) ++st;
-         return st;
-     };
-+    // V100 fork: the whole model's ranking, kept for the RAM-budget mode on a split (below the split, `profile` is
-+    // CUDA0's share only; ranking the RAM copy by that left every later stage's non-GPU expert on the files)
-+    std::vector<std::pair<int32_t, int32_t>> profile_all;
-     if (multi_gpu) {
-+        profile_all = profile;
-         std::vector<std::pair<int32_t, int32_t>> mine;
-         for (const auto& pr : profile) {
-             const int st = stage_of(pr.first);
-@@ -3757,10 +3808,33 @@ int main(int argc, char** argv) {
-             const int64_t k = plan_lend(chunk);
-             if (k > 0) lend_from = xcache.slots() - k;
-         }
--        if (src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
--                                     o.resident_budget, &profile)) {
--            if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
--                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
-+        // a layer split: the later stages' caches hold their layers' experts on their own GPUs - none of those is
-+        // copied into RAM (the budget goes to the hottest experts no GPU holds)
-+        std::vector<std::pair<int32_t, int32_t>> stage_pairs;
-+        for (auto& st : stages)
-+            for (int64_t l = st->lb; l < st->le; ++l)
-+                for (int64_t e = 0; e < g.n_expert; ++e)
-+                    if (st->cache.slot_of(l, e) != strata::core::kNotResident)
-+                        stage_pairs.emplace_back((int32_t) l, (int32_t) e);
+@@ -5464,6 +5472,17 @@ int main(int argc, char** argv) {
+             for (int64_t l = st->lb; l < st->le; ++l)
+                 for (int64_t e = 0; e < g.n_expert; ++e)
+                     if (st->cache.slot_of(l, e) >= 0) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
 +        if (!stage_pairs.empty())
 +            std::fprintf(stderr, "strata generate: resident RAM mode on a layer split: %zu experts held by the later "
 +                                 "stages' GPUs are left out of the RAM copy\n", stage_pairs.size());
-+        // under WDDM a split keeps the RAM copy out of the GPU contexts (locked in RAM instead of page-locked by the
-+        // driver; STRATA_ARENA_PIN_GIB=0 allows it again, as for the arena)
++        // V100 fork: under WDDM a split keeps the RAM copy out of the GPU contexts - locked in RAM instead of
++        // page-locked by the driver (tens of GiB mapped into two contexts left WDDM refusing later allocations, and
++        // the locked copy decoded faster on the 4070 Super + V100 PC).  STRATA_ARENA_PIN_GIB=0 allows it again.
 +        if (multi_gpu && under_wddm() && strata::core::arena_pin_cap_gib() != 0) {
 +            src.set_no_pagelock(true);
 +            std::fprintf(stderr, "strata generate: layer split under WDDM: the RAM copy of the experts is locked in "
 +                                 "RAM, not page-locked by the GPU driver\n");
 +        }
-+        if (src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from, o.resident_headroom,
-+                                     o.resident_budget, multi_gpu ? &profile_all : &profile)) {
-+            int64_t xchg = std::min<int64_t>(o.adapt_swaps, 96);
-+            if (multi_gpu && !o.adapt_stage_swaps.empty()) {   // V100 fork: every card's swaps can be exchanges
-+                int64_t sum = 0;
-+                for (const int x : o.adapt_stage_swaps) sum += x;
-+                xchg = std::min<int64_t>(std::max<int64_t>(sum, 1), 256);
-+            }
-+            if (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(xchg, err)) {
-                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
-                 return 1;
-             }
-@@ -3811,6 +3885,8 @@ int main(int argc, char** argv) {
+         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
+         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
+                                                     o.resident_headroom, o.resident_budget, &rank_all);
+@@ -5572,6 +5591,8 @@ int main(int argc, char** argv) {
              int32_t first_now = -1;        // where its buffers are laid out now
              int64_t lent_chunk = 0;
              std::vector<std::pair<int32_t, int32_t>> lent;
 +            int64_t chunk = 0;             // V100 fork: this participant's largest chunk (a later stage may read
 +                                           // in bigger chunks than CUDA0: Prefill gathers the hand-offs)
          };
-         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
-             const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, c);
-@@ -3884,8 +3960,42 @@ int main(int argc, char** argv) {
+         // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
+         // per layer), otherwise max_blob each.
+@@ -5753,8 +5774,49 @@ int main(int argc, char** argv) {
                      std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens so its buffers fit in "
                                           "every expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
                  o.prefill_chunk = chunk;
@@ -1361,10 +1025,10 @@ index 1a2f203..bcdf3a8 100644
 +                // a 12 GB + 32 GB split that is the small card's limit, and the big card then streams its
 +                // non-resident experts once per small chunk.  With `--prefill auto` (auto:N above 8192), the stage
 +                // after CUDA0 takes the largest chunk (up to N) that IT can lend under the same rules, a multiple of
-+                // CUDA0's: CUDA0's chunks are gathered into one hand-off (Prefill::run).  Stages after it receive one
-+                // hand-off per run of the stage before them, so they gain nothing above that stage's chunk.  The tokens and the
-+                // order of every layer's work are the same, so the answers are; only the expert stream changes.
-+                // STRATA_SPLIT_STAGE_CHUNKS=0: one chunk for all (as before).
++                // CUDA0's: CUDA0's chunks are gathered into one hand-off (Prefill::run_impl).  Stages after it
++                // receive one hand-off per run of the stage before them, so they gain nothing above that stage's
++                // chunk.  The tokens and the order of every layer's work are the same, so the answers are; only the
++                // expert stream changes.  STRATA_SPLIT_STAGE_CHUNKS=0: one chunk for all (as before).
 +                static const bool stage_chunks_ok = [] {
 +                    const char* v = std::getenv("STRATA_SPLIT_STAGE_CHUNKS");
 +                    return v == nullptr || v[0] != '0';
@@ -1374,12 +1038,19 @@ index 1a2f203..bcdf3a8 100644
 +                        PfPart& p = pf_parts[i];
 +                        const int64_t floor_c = pf_parts[i - 1].chunk;
 +                        const int64_t top_c = i == 1 ? INT64_MAX : pf_parts[1].chunk;
++                        // a stage after the second gets one hand-off per run of the one before it: no bigger chunk,
++                        // and the earlier stage's chunk only where this cache can lend it
++                        if (i >= 2) {
++                            p.chunk = fits_one(p, floor_c, true) ? floor_c : chunk;
++                            continue;
++                        }
 +                        p.chunk = floor_c;
-+                        for (const int64_t c : kAutoChunks) {
-+                            if (c <= floor_c) break;
-+                            if (c > o.prefill_auto_max || c > o.max_context || c > top_c || c % floor_c != 0) continue;
-+                            const int64_t k = part_slots(p, c);
-+                            if (k > 0 && k + 128 <= p.cache->slots() && k * 100 <= kAutoLendPct * p.cache->slots()) {
++                        // multiples of the earlier stage's chunk (0.1.40 picks CUDA0's on a 256-token grid), largest
++                        // first, up to --prefill auto:N
++                        for (int64_t k = floor_c > 0 ? o.prefill_auto_max / floor_c : 0; k >= 2; --k) {
++                            const int64_t c = k * floor_c;
++                            if (c > o.max_context || c > top_c) continue;
++                            if (fits_one(p, c, true)) {
 +                                p.chunk = c;
 +                                break;
 +                            }
@@ -1396,7 +1067,7 @@ index 1a2f203..bcdf3a8 100644
                      p.first_now = p.first;
                  }
                  // #340: a split stage whose card still has room for the chunk's buffers (its cache already holds
-@@ -3903,7 +4013,7 @@ int main(int argc, char** argv) {
+@@ -5772,7 +5834,7 @@ int main(int argc, char** argv) {
                          const strata::core::OnDevice on(p.dev);
                          size_t fb = 0, tb = 0;
                          if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
@@ -1405,7 +1076,7 @@ index 1a2f203..bcdf3a8 100644
                          if ((uint64_t) fb >= need + (3ull << 29)) {
                              std::fprintf(stderr, "strata serve:   CUDA%d keeps its own prompt buffers (%.2f GiB of "
                                                   "%.2f GiB free): no loan\n", p.dev < 0 ? 0 : p.dev,
-@@ -3953,6 +4063,26 @@ int main(int argc, char** argv) {
+@@ -5823,6 +5885,26 @@ int main(int argc, char** argv) {
          // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned (#253) a
          // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
          // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
@@ -1432,7 +1103,7 @@ index 1a2f203..bcdf3a8 100644
          auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
              for (size_t i = 0; i < stages.size(); ++i) {
                  GpuStage& st = *stages[i];
-@@ -3965,7 +4095,7 @@ int main(int argc, char** argv) {
+@@ -5835,7 +5917,7 @@ int main(int argc, char** argv) {
                      sb = st.cache.device_slot(pf_parts[i + 1].first);
                      sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                  }
@@ -1441,7 +1112,7 @@ index 1a2f203..bcdf3a8 100644
                                  err, sb, sbb)) {
                      err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
                      return err.find("do not fit") != std::string::npos ? 2 : 1;
-@@ -3990,7 +4120,10 @@ int main(int argc, char** argv) {
+@@ -5860,7 +5942,10 @@ int main(int argc, char** argv) {
                      const strata::core::OnDevice on(dev);
                      size_t fb = 0, tb = 0;
                      cudaMemGetInfo(&fb, &tb);
@@ -1453,7 +1124,7 @@ index 1a2f203..bcdf3a8 100644
                      if (need + kHeadroom > (int64_t) fb) {
                          dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
                          return false;
-@@ -4000,6 +4133,7 @@ int main(int argc, char** argv) {
+@@ -5870,6 +5955,7 @@ int main(int argc, char** argv) {
              };
              int dev = 0;
              int64_t need = 0, fb = 0;
@@ -1461,7 +1132,7 @@ index 1a2f203..bcdf3a8 100644
              if (!own_fits(o.prefill_chunk, dev, need, fb)) {
                  int64_t c = 0;
                  for (const int64_t s : kStepChunks) {
-@@ -4012,12 +4146,30 @@ int main(int argc, char** argv) {
+@@ -5882,12 +5968,30 @@ int main(int argc, char** argv) {
                                           "%lld MiB free: %lld-token chunks\n", (long long) o.prefill_chunk,
                                   (long long) (need >> 20), dev, (long long) (fb >> 20), (long long) c);
                      o.prefill_chunk = c;
@@ -1492,7 +1163,7 @@ index 1a2f203..bcdf3a8 100644
              int64_t next = 0;
              for (const int64_t c : kStepChunks)
                  if (c < o.prefill_chunk) { next = c; break; }
-@@ -4033,6 +4185,7 @@ int main(int argc, char** argv) {
+@@ -5903,6 +6007,7 @@ int main(int argc, char** argv) {
                  sp.reset();
                  (void) cudaGetLastError();
                  o.prefill_chunk = next;
@@ -1500,175 +1171,22 @@ index 1a2f203..bcdf3a8 100644
                  if (any_loan) {                  // smaller loans for the smaller chunk
                      for (PfPart& p : pf_parts)
                          if (p.first >= 0) {
-@@ -4426,9 +4579,107 @@ int main(int argc, char** argv) {
-             pending.clear();
-             res_upload();
-         };
-+        // ---- V100 fork: THE ADAPTIVE TIER WITHOUT STALLS.  The swap below (0.1.32's) ran in a thread beside the
-+        // commit and the draft, and the decode loop joined it: it waited for every evicted expert's copy back to RAM
-+        // (cudaStreamSynchronize), then copied each incoming expert from RAM into its slot - from pageable memory on
-+        // a WDDM split, so each copy blocks - and the next round's apply_pending then moved every evicted blob into
-+        // its RAM place with a memcpy.  Up to 96 x ~3 MB, ~2/3 of them over the V100's PCIe 3.0 x4 link (3.3 GB/s):
-+        // ~140 ms every 4th window, measured as 10-25 ms per window of decode time that no stage accounted for
-+        // (v100_decodebench, 2026-10-03; 23-32 ms with the V100 alone).
-+        // Now the heavy parts run on a worker thread while windows keep running, and every change of what is
-+        // resident (host_res and the device tables, the RAM copy's index) happens on this thread between windows,
-+        // one step per round: 1 worker: evicted experts -> exchange buffers; main: they become CPU experts (read
-+        // from those buffers), tables uploaded; 3 worker: incoming experts -> the freed slots; main: they become
-+        // resident, tables uploaded; 5 worker: evicted blobs -> the incoming experts' RAM places; main: the RAM
-+        // copy's index flips.  Same swaps, same bytes: the answers do not change.  STRATA_ADAPT_SYNC=1: 0.1.32's.
-+        static const bool adapt_sync = [] {
-+            const char* v = std::getenv("STRATA_ADAPT_SYNC");
-+            return v != nullptr && v[0] == '1';
-+        }();
-+        struct AdaptSwap { int32_t layer, in, out, slot; int64_t q; };
-+        auto swap_owner = [&](int32_t layer) -> SwapOwner {
-+            const int stn = multi_gpu ? stage_of(layer) : 0;
-+            GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
-+            return gs ? SwapOwner{&gs->cache, gs->dev, gs->adapt_stream} : SwapOwner{&xcache, -1, adapt_stream};
-+        };
-+        // copies on the owners' adapt streams, then waits for those streams (the worker's part)
-+        auto adapt_copies = [&](const std::vector<AdaptSwap>& job_swaps, bool to_device) -> bool {
-+            std::vector<SwapOwner> used;
-+            for (const AdaptSwap& w : job_swaps) {
-+                if (!to_device && w.q < 0) continue;
-+                const SwapOwner o_ = swap_owner(w.layer);
-+                const strata::core::OnDevice on(o_.dev);
-+                const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer);
-+                uint8_t* slot_ptr = (uint8_t*) o_.cache->device_slot(w.slot);
-+                cudaError_t e;
-+                if (to_device) {
-+                    const uint8_t* b = srcp->blob(w.layer, w.in);
-+                    if (b == nullptr) return false;
-+                    e = cudaMemcpyAsync(slot_ptr, b, bytes, cudaMemcpyHostToDevice, o_.stream);
-+                } else {
-+                    e = cudaMemcpyAsync(src.exchange_buffer(w.q), slot_ptr, bytes, cudaMemcpyDeviceToHost, o_.stream);
-+                }
-+                if (e != cudaSuccess) return false;
-+                bool seen = false;
-+                for (const SwapOwner& u : used) seen = seen || (u.dev == o_.dev && u.stream == o_.stream);
-+                if (!seen) used.push_back(o_);
-+            }
-+            for (const SwapOwner& u : used) {
-+                const strata::core::OnDevice on(u.dev);
-+                if (cudaStreamSynchronize(u.stream) != cudaSuccess) return false;
-+            }
-+            return true;
-+        };
-+        // the tables, uploaded and landed before the worker's next copy (res_upload's copies come from pageable
-+        // memory: cudaMemcpy may return before its DMA has written the device table)
-+        auto res_upload_landed = [&]() {
-+            res_upload();
-+            if (d_res != nullptr) cudaStreamSynchronize(0);
-+            for (auto& st : stages) {
-+                const strata::core::OnDevice on(st->dev);
-+                cudaStreamSynchronize(0);
-+            }
-+        };
-+        // declared after everything its worker uses: an early return waits for the worker (~future) first
-+        struct AdaptJob {
-+            int state = 0;                 // 0 idle, 1 fetching, 3 uploading, 5 copying (the worker's step)
-+            std::vector<AdaptSwap> swaps;
-+            std::future<bool> work;
-+        } ajob;
-+        // one step of the job (`wait`: to the end); false only when a copy failed
-+        auto adapt_step = [&](bool wait) -> bool {
-+            while (ajob.state != 0) {
-+                if (!wait && ajob.work.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return true;
-+                if (!ajob.work.get()) { ajob.state = 0; ajob.swaps.clear(); return false; }
-+                if (ajob.state == 1) {          // the evicted experts are in RAM: the CPU computes them from now on
-+                    std::vector<AdaptSwap> kept;
-+                    for (AdaptSwap& w : ajob.swaps) {
-+                        if (w.q >= 0 && !src.stage_exchange(w.layer, w.in, w.out, w.q)) continue;
-+                        host_res[(size_t) w.layer * g.n_expert + w.out] = strata::core::kNotResident;
-+                        kept.push_back(w);
-+                    }
-+                    ajob.swaps.swap(kept);
-+                    res_upload_landed();
-+                    ajob.state = 3;
-+                    ajob.work = std::async(std::launch::async, [&] { return adapt_copies(ajob.swaps, true); });
-+                } else if (ajob.state == 3) {   // the incoming experts have landed in their slots
-+                    for (const AdaptSwap& w : ajob.swaps) host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
-+                    res_upload_landed();
-+                    ajob.state = 5;
-+                    ajob.work = std::async(std::launch::async, [&] { return src.complement_ready() ? src.exchange_copy() : true; });
-+                } else {                        // the evicted blobs are in their RAM places
-+                    if (src.complement_ready()) src.exchange_flip();
-+                    ajob.state = 0;
-+                    ajob.swaps.clear();
-+                }
-+                if (!wait) return true;         // one step per round
-+            }
-+            return true;
-+        };
-         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
-+        int64_t adapt_done[8] = {};   // V100 fork: swaps started per card since the start (the request log)
-         auto adapt = [&]() -> bool {
--            if (!pending.empty()) return true;   // the previous swaps are still in flight
-+            if (!pending.empty() || ajob.state != 0) return true;   // the previous swaps are still in flight
-             struct Swap { float gain; int32_t layer, in, out; };
-             std::vector<Swap> swaps;
-             std::vector<std::pair<float, int32_t>> cand, vict;
-@@ -4452,8 +4703,45 @@ int main(int argc, char** argv) {
-                 }
-             }
-             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
--            if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
--            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
-+            if (multi_gpu && !o.adapt_stage_swaps.empty()) {   // V100 fork: each card's own budget, best gains first
-+                std::vector<int> left(o.adapt_stage_swaps);
-+                size_t kept = 0;
-+                for (const Swap& w : swaps) {
-+                    const size_t st = (size_t) stage_of(w.layer);
-+                    int& n = st < left.size() ? left[st] : left.back();   // cards past the list: the last budget
-+                    if (n <= 0) continue;
-+                    --n;
-+                    swaps[kept++] = w;
-+                }
-+                swaps.resize(kept);
-+            } else if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
-+            for (const Swap& w : swaps) ++adapt_done[std::min(7, multi_gpu ? stage_of(w.layer) : 0)];
-+            if (!adapt_sync) {   // V100 fork: the job above (the worker copies; this only picks and starts it)
-+                ajob.swaps.clear();
-+                int64_t q = 0;
-+                for (const Swap& s : swaps) {
-+                    const int32_t slot = host_res[(size_t) s.layer * g.n_expert + s.out];
-+                    if (slot < 0 || swap_owner(s.layer).cache == nullptr) continue;
-+                    int64_t qs = -1;   // an exchange (the RAM copy takes the evicted expert) when it can
-+                    if (src.complement_ready() && src.has_resident(s.layer, s.in) && !src.has_resident(s.layer, s.out)) {
-+                        if (q >= src.exchange_capacity()) continue;
-+                        qs = q++;
-+                    }
-+                    ajob.swaps.push_back({s.layer, s.in, s.out, slot, qs});
-+                }
-+                for (float& v : drive.d.usage) v *= 0.7f;
-+                if (ajob.swaps.empty()) return true;
-+                ajob.state = 1;
-+                ajob.work = std::async(std::launch::async, [&] { return adapt_copies(ajob.swaps, false); });
-+                return true;
-+            }
-+            // a layer split: each evicted expert is copied back from the cache (and device) that owns its layer
-+            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, [&](int32_t layer) {
-+                    const int stn = multi_gpu ? stage_of(layer) : 0;
-+                    GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
-+                    return gs ? SwapOwner{&gs->cache, gs->dev, gs->adapt_stream} : SwapOwner{&xcache, -1, adapt_stream};
-+                }))
-+                return false;
-             bool main_live = false;
-             for (const Swap& s : swaps) {
-                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
-@@ -5111,17 +5399,21 @@ int main(int argc, char** argv) {
+@@ -8726,17 +8831,25 @@ int main(int argc, char** argv) {
                  const auto t_ln = Clock::now();
                  // what this segment needs, capped by the configured chunk: a request lends only what its own
                  // prompt needs, so a large chunk costs a short prompt nothing
--                const int64_t want_full = request_chunk(tokens, o.prefill_chunk);
+-                const int64_t want_full = equal_chunk(tokens, o.prefill_chunk);
 -                // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
 -                const int64_t want = split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
 -                                                                                 : want_full;
 -                if (want <= 0) {
 +                // V100 fork: per participant - a later stage may read in bigger chunks (PfPart::chunk)
 +                auto want_of = [&](const PfPart& p) -> int64_t {
-+                    const int64_t want_full = request_chunk(tokens, p.sp->max_chunk());
++                    // CUDA0 at the configured chunk (relend may have lowered it below its laid-out maximum); a later
++                    // stage at its own, never above what its Prefill was laid out for
++                    const int64_t cap = &p == &pf_parts[0] ? o.prefill_chunk
++                                                           : std::min(std::max(o.prefill_chunk, p.chunk), p.sp->max_chunk());
++                    const int64_t want_full = equal_chunk(tokens, cap);
 +                    // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
 +                    return split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small) : want_full;
 +                };
@@ -1684,7 +1202,7 @@ index 1a2f203..bcdf3a8 100644
                      if (!p.lent.empty()) {
                          if (want <= p.lent_chunk) continue;            // its current loan already covers this
                          // ONLY this participant's loan goes back: `refill` would return the other participants'
-@@ -5151,11 +5443,15 @@ int main(int argc, char** argv) {
+@@ -8766,7 +8879,7 @@ int main(int argc, char** argv) {
                      int64_t n_lent = 0;
                      for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
                      std::fprintf(stderr, "strata trace: lent %lld slots for %lld tokens in %.1f ms\n", (long long) n_lent,
@@ -1693,36 +1211,10 @@ index 1a2f203..bcdf3a8 100644
                      std::fflush(stderr);
                  }
                  return true;
-             };
-+            if (!adapt_step(true)) {   // V100 fork: a job left by the last request finishes before anything lends
-+                std::printf("ERR an adaptive swap failed\n");
-+                return 1;
-+            }
-             apply_pending(true);
-             // per-request sampling for the verify window's head (greedy when temperature is absent)
-             strata::kernels::SamplerParams req_sp;
-@@ -5319,6 +5615,10 @@ int main(int argc, char** argv) {
-                 drive.d.layers = 0;
-                 drive.d.experts = 0;
-                 drive.d.failed = false;
-+                if (!adapt_step(false)) {
-+                    std::printf("ERR an adaptive swap failed\n");
-+                    return 1;
-+                }
-                 apply_pending(false);
-                 if (hist_n > 0) {
-                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
-@@ -5558,6 +5858,44 @@ int main(int argc, char** argv) {
+@@ -10021,6 +10134,37 @@ int main(int argc, char** argv) {
                               100.0 * (double) req_hits / (double) req_look,
-                              (long long) req_hits, (long long) req_look);
+                              (long long) req_hits, (long long) req_look, off);
              }
-+            if (!drive.d.usage.empty()) {
-+                std::string per;
-+                for (int st = 0; st < (multi_gpu ? 1 + (int) stages.size() : 1) && st < 8; ++st)
-+                    per += (st ? ", CUDA" : "CUDA") + std::to_string(st > 0 ? stages[(size_t) st - 1]->dev : 0) + " " +
-+                           std::to_string((long long) adapt_done[st]);
-+                std::fprintf(stderr, "strata serve: adaptive swaps since the start: %s\n", per.c_str());
-+            }
 +            // V100 fork: the PLE rows' reads (layer 1's n-gram table on the SSD; cumulative since the start) - each
 +            // window reads its tokens' rows before it launches, so their latency is decode time
 +            if (ss.ple.table != nullptr)
@@ -1730,7 +1222,7 @@ index 1a2f203..bcdf3a8 100644
 +                    std::fprintf(stderr, "strata serve: %s\n", io.c_str());
 +            // V100 fork: each prompt path's share of this request - its chunk, the experts it streamed to its card
 +            // (and how many of them by DMA straight from page-locked RAM), the host time staging the others, and the
-+            // time spent reading experts from the model files (lent slots' experts, mostly)
++            // time spent reading experts from the model files (lent slots' experts, mostly); tools/v100_workload.py
 +            {
 +                static std::vector<strata::prefill::PrefillStats> pf_prev;
 +                static double file_ms_prev = 0.0;
@@ -1757,197 +1249,79 @@ index 1a2f203..bcdf3a8 100644
              // the resident RAM mode, cumulative: experts read from experts.bin since the copy was made (what the plain
              // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
              if (src.complement_ready())
-diff --git a/tests/cuda/bf16_gemm_fallback_test.cpp b/tests/cuda/bf16_gemm_fallback_test.cpp
-new file mode 100644
-index 0000000..bf89075
---- /dev/null
-+++ b/tests/cuda/bf16_gemm_fallback_test.cpp
-@@ -0,0 +1,112 @@
-+// tests/cuda/bf16_gemm_fallback_test.cpp - V100 fork: the prompt path's BF16 GEMM (Gemm::bf16) on this GPU.
-+//
-+//   bf16_gemm_fallback_test cublas     cuBLAS's BF16 GemmEx (falls back to the kernel by itself if cuBLAS refuses)
-+//   bf16_gemm_fallback_test fallback   the FP32 fallback kernel (STRATA_BF16_GEMM_FALLBACK=1) on any card
-+//
-+// Random BF16 X [T, K] and W [N, K], Y = X . W^T (+ beta * Y) against an FP64 CPU reference, on shapes like the
-+// prompt path's (ragged edges included).  Prints the largest relative error and the time; exit 0 when every case
-+// is within 1e-3 of the largest |Y| (FP32 accumulation of exact BF16 products), 1 otherwise.
-+#include "strata/prefill/gemm.hpp"
-+
-+#include <cuda_runtime.h>
-+
-+#include <chrono>
-+#include <cmath>
-+#include <cstdint>
-+#include <cstdio>
-+#include <cstdlib>
-+#include <cstring>
-+#include <random>
-+#include <string>
-+#include <vector>
-+
-+namespace {
-+
-+uint16_t to_bf16(float f) {
-+    uint32_t u;
-+    std::memcpy(&u, &f, 4);
-+    u += 0x7fffu + ((u >> 16) & 1u);   // round to nearest even (no NaNs here)
-+    return (uint16_t) (u >> 16);
-+}
-+float from_bf16(uint16_t h) {
-+    const uint32_t u = (uint32_t) h << 16;
-+    float f;
-+    std::memcpy(&f, &u, 4);
-+    return f;
-+}
-+
-+bool ck(cudaError_t e, const char* what) {
-+    if (e != cudaSuccess) std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-+    return e == cudaSuccess;
-+}
-+
-+}  // namespace
-+
-+int main(int argc, char** argv) {
-+    const std::string mode = argc > 1 ? argv[1] : "cublas";
-+#if defined(_WIN32)
-+    _putenv_s("STRATA_BF16_GEMM_FALLBACK", mode == "fallback" ? "1" : "-1");
-+#else
-+    setenv("STRATA_BF16_GEMM_FALLBACK", mode == "fallback" ? "1" : "-1", 1);
-+#endif
-+    int dev = 0;
-+    cudaDeviceProp p{};
-+    if (!ck(cudaGetDevice(&dev), "cudaGetDevice") || !ck(cudaGetDeviceProperties(&p, dev), "props")) return 1;
-+    std::printf("bf16_gemm_fallback_test (%s) on %s, sm_%d%d\n", mode.c_str(), p.name, p.major, p.minor);
-+    cudaStream_t st = nullptr;
-+    if (!ck(cudaStreamCreate(&st), "stream")) return 1;
-+    strata::prefill::Gemm gemm;
-+    std::string err;
-+    if (!gemm.init(st, 1 << 20, err)) { std::fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
-+
-+    struct Case { int64_t T, N, K; float beta; };
-+    const Case cases[] = {{1, 1, 16, 0.0f},     {7, 33, 100, 0.0f},     {64, 64, 64, 1.0f},
-+                          {200, 2560, 640, 0.0f}, {513, 640, 2560, 1.0f}, {512, 2560, 2560, 0.0f}};
-+    std::mt19937 rng(1234);
-+    std::normal_distribution<float> nd(0.0f, 1.0f);
-+    bool all_ok = true;
-+    for (const Case& c : cases) {
-+        std::vector<uint16_t> X((size_t) (c.T * c.K)), W((size_t) (c.N * c.K));
-+        for (auto& v : X) v = to_bf16(nd(rng));
-+        for (auto& v : W) v = to_bf16(nd(rng) * 0.05f);
-+        std::vector<float> Y0((size_t) (c.T * c.N));
-+        for (auto& v : Y0) v = nd(rng);
-+        uint16_t *dX = nullptr, *dW = nullptr;
-+        float* dY = nullptr;
-+        if (!ck(cudaMalloc(&dX, X.size() * 2), "malloc") || !ck(cudaMalloc(&dW, W.size() * 2), "malloc") ||
-+            !ck(cudaMalloc(&dY, Y0.size() * 4), "malloc"))
-+            return 1;
-+        cudaMemcpy(dX, X.data(), X.size() * 2, cudaMemcpyHostToDevice);
-+        cudaMemcpy(dW, W.data(), W.size() * 2, cudaMemcpyHostToDevice);
-+        cudaMemcpy(dY, Y0.data(), Y0.size() * 4, cudaMemcpyHostToDevice);
-+        gemm.bf16(dX, dW, dY, c.T, c.N, c.K, 0, c.beta);   // warm-up / the first call decides cuBLAS or not
-+        cudaMemcpy(dY, Y0.data(), Y0.size() * 4, cudaMemcpyHostToDevice);
-+        cudaStreamSynchronize(st);
-+        const auto t0 = std::chrono::steady_clock::now();
-+        gemm.bf16(dX, dW, dY, c.T, c.N, c.K, 0, c.beta);
-+        if (!ck(cudaStreamSynchronize(st), "gemm")) return 1;
-+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-+        std::vector<float> Y(Y0.size());
-+        cudaMemcpy(Y.data(), dY, Y.size() * 4, cudaMemcpyDeviceToHost);
-+        double max_ref = 0, max_err = 0;
-+        for (int64_t t = 0; t < c.T; ++t)
-+            for (int64_t n = 0; n < c.N; ++n) {
-+                double r = c.beta != 0.0f ? (double) c.beta * Y0[(size_t) (t * c.N + n)] : 0.0;
-+                for (int64_t k = 0; k < c.K; ++k)
-+                    r += (double) from_bf16(X[(size_t) (t * c.K + k)]) * (double) from_bf16(W[(size_t) (n * c.K + k)]);
-+                max_ref = std::max(max_ref, std::fabs(r));
-+                max_err = std::max(max_err, std::fabs(r - (double) Y[(size_t) (t * c.N + n)]));
-+            }
-+        const double rel = max_err / std::max(max_ref, 1e-30);
-+        const bool ok = rel < 1e-3;
-+        all_ok = all_ok && ok;
-+        std::printf("  T=%-5lld N=%-5lld K=%-5lld beta=%.0f  max rel err %.2e  %8.3f ms  %.2f TFLOP/s  %s\n",
-+                    (long long) c.T, (long long) c.N, (long long) c.K, c.beta, rel, ms,
-+                    2.0 * c.T * c.N * c.K / (ms * 1e9), ok ? "ok" : "FAIL");
-+        cudaFree(dX);
-+        cudaFree(dW);
-+        cudaFree(dY);
-+    }
-+    std::printf("%s\n", all_ok ? "PASS" : "FAIL");
-+    return all_ok ? 0 : 1;
-+}
-diff --git a/tools/test_setup_choices.py b/tools/test_setup_choices.py
-index 195e308..7354398 100644
---- a/tools/test_setup_choices.py
-+++ b/tools/test_setup_choices.py
-@@ -101,10 +101,13 @@ class ExperimentalSm60(unittest.TestCase):
+diff --git a/tools/test_setup_golden.py b/tools/test_setup_golden.py
+index af0777a..1575148 100644
+--- a/tools/test_setup_golden.py
++++ b/tools/test_setup_golden.py
+@@ -156,6 +156,19 @@ def record() -> dict:
+     return res
  
-     def test_the_gate(self):
-         with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM60": ""}):
--            for arch in ("60", "61", "70"):
-+            for arch in ("60", "61"):
-                 p = setup.gpu_problem(self.card(arch))
-                 self.assertIn("not supported", p)
-                 self.assertIn("STRATA_EXPERIMENTAL_SM60=1", p)
-+            self.assertIsNone(setup.gpu_problem(self.card("70")))   # V100 fork: Volta admitted by default
-+        with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM60": "0"}):
-+            self.assertIn("not supported", setup.gpu_problem(self.card("70")))
-             self.assertNotIn("STRATA_EXPERIMENTAL_SM60", setup.gpu_problem(self.card("52")))
-             self.assertIsNone(setup.gpu_problem(self.card("75")))
-         with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM60": "1"}):
-@@ -115,7 +118,7 @@ class ExperimentalSm60(unittest.TestCase):
  
-     def test_the_build_flag(self):
-         self.assertEqual(setup.engine_defs([61]), ["-DSTRATA_EXPERIMENTAL_SM60=ON"])
--        self.assertEqual(setup.engine_defs([70, 86]), ["-DSTRATA_EXPERIMENTAL_SM60=ON"])
-+        self.assertEqual(setup.engine_defs([70, 86]), ["-DSTRATA_EXPERIMENTAL_SM60=ON", "-DSTRATA_MMQ_KQUANTS=ON"])
-         self.assertEqual(setup.engine_defs([75, 86, 120]), [])
++# V100 fork: the golden configs are upstream's (#498: no RAM budget on a split); the fork keeps the budget there
++# (setup.budget_split_ok, tools/test_setup_unsloth.ForkBudgetSplit), so these run with upstream's rule
++_ENV = mock.patch.dict("os.environ", {"STRATA_BUDGET_SPLIT": "0"})
++
++
++def setUpModule():
++    _ENV.start()
++
++
++def tearDownModule():
++    _ENV.stop()
++
++
+ class Golden(unittest.TestCase):
+     """--yes and Enter: the same config as the baseline wherever the baseline wrote one."""
  
-     def test_find_nvcc_below(self):
 diff --git a/tools/test_setup_unsloth.py b/tools/test_setup_unsloth.py
-index 080b51c..8516e6f 100644
+index 9dd7514..ead5802 100644
 --- a/tools/test_setup_unsloth.py
 +++ b/tools/test_setup_unsloth.py
-@@ -7,6 +7,8 @@ engine version it needs, one GPU, no images.  Mocked - no GPU, no downloads, not
- from __future__ import annotations
+@@ -26,6 +26,19 @@ M = "UD-Q4_K_XL"
+ REV = "38bb39ee97821de2c9009abb7e93950eec396e66"
  
- import contextlib
-+import os
-+from unittest import mock
- import hashlib
- import io
- import json
-@@ -243,11 +245,26 @@ class Main(unittest.TestCase):
-         self.assertIn("needs 48 GB of RAM or more", out)
-         self.assertEqual(self.downloads, [])
  
--    def test_one_gpu_and_no_images(self):
-+    def test_two_gpus_and_no_images(self):
-+        # V100 fork: the RAM-budget mode keeps the layer split (STRATA_BUDGET_ONE_GPU=1 restores one GPU)
-         code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1", "--vision", "yes", "--low-ram", "on"],
-                                    n_gpus=2)
-         self.assertEqual(code, 0, out)
--        self.assertIn("runs on one GPU", out)
-+        self.assertIn("shares its layers across", out)
-+        self.assertEqual(cfg["gpu"], [0, 1])
-+        self.assertEqual(cfg["layer_split"], "auto")
-+        self.assertIn("images are not available with UD-Q4_K_XL", out)
-+        self.assertIn("--low-ram on does not apply", out)
-+        self.assertNotIn("--vision", cfg["args"])
-+        self.assertNotIn("--mmap-experts", cfg["args"])
-+        self.assertFalse(any("--experts-bin" in r for r in self.runs))
++# V100 fork: these tests describe upstream's rule for UD-Q4_K_XL on several GPUs (#498: no RAM budget on a split);
++# the fork keeps the budget there by default (setup.budget_split_ok) - the fork's own test is ForkBudgetSplit below
++_ENV = mock.patch.dict("os.environ", {"STRATA_BUDGET_SPLIT": "0"})
 +
-+    def test_one_gpu_and_no_images(self):
-+        with mock.patch.dict(os.environ, {"STRATA_BUDGET_ONE_GPU": "1"}):
-+            code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1", "--vision", "yes", "--low-ram", "on"],
-+                                       n_gpus=2)
-+        self.assertEqual(code, 0, out)
-+        self.assertIn("on one GPU", out)
-         self.assertIn("images are not available with UD-Q4_K_XL", out)
-         self.assertIn("--low-ram on does not apply", out)
-         self.assertNotIn("layer_split", cfg)
++
++def setUpModule():
++    _ENV.start()
++
++
++def tearDownModule():
++    _ENV.stop()
++
++
+ class Pins(unittest.TestCase):
+     def test_the_four_shards(self):
+         fam = setup.FAMILIES["unsloth"]
+@@ -390,6 +403,21 @@ class Main(Base):
+ X = "UD-IQ4_XS"
+ 
+ 
++class ForkBudgetSplit(Base):
++    """V100 fork: UD-Q4_K_XL on two GPUs keeps its RAM budget (the engine runs it on a layer split)."""
++
++    def test_split_keeps_the_budget(self):
++        with mock.patch.dict("os.environ", {"STRATA_BUDGET_SPLIT": "1"}):
++            code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1"], n_gpus=2, ram=96.0)
++            self.assertEqual(code, 0, out)
++            self.assertEqual(cfg["gpu"], [0, 1])
++            self.assertIn("--resident-budget-gib", cfg["args"])
++            self.assertIn("the RAM budget holds the most-used experts no GPU holds", out)
++            c = {"args": ["--native", "x-UD-Q4_K_XL-00001-of-00004.gguf", "--resident-budget-gib", "40"]}
++            self.assertFalse(setup.split_budget(c, True, True))   # a start on several GPUs keeps it too
++            self.assertIn("--resident-budget-gib", c["args"])
++
++
+ class IQ4XS(Base):
+     """#621: Unsloth's UD-IQ4_XS, a regular (not experimental) choice from 0.1.39 - three pinned shards, the same
+     RAM-budget setup as UD-Q4_K_XL (the pack with --compat-bf16, never experts.bin, one GPU), engine 0.1.38 or newer,
 diff --git a/tools/v100_bench.py b/tools/v100_bench.py
 new file mode 100644
-index 0000000..43e0977
+index 0000000..28f4988
 --- /dev/null
 +++ b/tools/v100_bench.py
 @@ -0,0 +1,243 @@
@@ -2196,7 +1570,7 @@ index 0000000..43e0977
 +    sys.exit(main())
 diff --git a/tools/v100_cachesim.py b/tools/v100_cachesim.py
 new file mode 100644
-index 0000000..6885560
+index 0000000..2269d3d
 --- /dev/null
 +++ b/tools/v100_cachesim.py
 @@ -0,0 +1,261 @@
@@ -2463,10 +1837,10 @@ index 0000000..6885560
 +    raise SystemExit(main())
 diff --git a/tools/v100_decodebench.py b/tools/v100_decodebench.py
 new file mode 100644
-index 0000000..859db0d
+index 0000000..286e4fc
 --- /dev/null
 +++ b/tools/v100_decodebench.py
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,335 @@
 +"""V100 fork: where the decode (writing) time goes on the 4070 Super + V100 split, and what changes it.
 +
 +Every variant restarts the engine with one change against the config (strata-unsloth-ud-q4_k_xl.json, 256K context)
@@ -2508,7 +1882,7 @@ index 0000000..859db0d
 +
 +# name -> (what it tests, extra args {flag: value|None}, extra env, cfg edit)
 +VARIANTS = {
-+    "baseline": ("the config as it is (4070S layers 0-16, V100 the rest)", {}, {}, None),
++    "baseline": ("the config as it is", {}, {}, None),
 +    "profile": ("baseline + the GPU stage stamps of every window (STRATA_VERIFY_PROFILE)", {},
 +                {"STRATA_VERIFY_PROFILE": "1"}, None),
 +    "v100_only": ("the V100 alone, same config (the comparison you asked about)", {}, {}, one_gpu(1)),
@@ -2616,21 +1990,63 @@ index 0000000..859db0d
 +                  {"--ple-gguf": None}, {}, None),
 +    "ple_shard_end": ("the PLE table from shard 2 again, last", {"--ple-gguf": None}, {}, None),
 +})
-+# round 8 (2026-10-03): the adaptive tier's swap budget per card (--adapt-stage-swaps CUDA0,CUDA1).  Replaying the
-+# workload runs' routing (tools/v100_cachesim.py): the 4070 Super's layers answer ~55% of their lookups on the GPU,
-+# the V100's ~94%, and the shared budget of 32 gives the 4070 Super only ~17 swaps a round; a budget per card
-+# replayed 77.0 -> 80.0% (96,32).  The 4070 Super's swaps cross its x16 link; the V100 keeps its 32.
++# round 8 (2026-10-03): per-card swap budgets (--adapt-stage-swaps) raised the hit rate but not the speed; the option
++# was dropped in the upstream 0.1.40 merge.
++# merge check (2026-10-06): upstream 0.1.40's asynchronous adaptive tier (--adapt-async 1, in the config now) against
++# its blocking one
 +VARIANTS.update({
-+    "stage64_32": ("swap budget per card: 64 for the 4070S, 32 for the V100 (--adapt-stage-swaps 64,32)",
-+                   {"--adapt-stage-swaps": "64,32"}, {}, None),
-+    "stage96_32": ("swap budget per card: 96 for the 4070S, 32 for the V100", {"--adapt-stage-swaps": "96,32"}, {}, None),
-+    "stage160_32": ("swap budget per card: 160 for the 4070S, 32 for the V100", {"--adapt-stage-swaps": "160,32"}, {},
-+                    None),
-+    "stage96_16": ("swap budget per card: 96 for the 4070S, 16 for the V100", {"--adapt-stage-swaps": "96,16"}, {}, None),
++    "async_off": ("upstream's blocking adaptive tier (--adapt-async 0)", {"--adapt-async": "0"}, {}, None),
++})
++# merge A/B (2026-10-06): decode measured slower after the merge (CPU expert time per window ~2x).  The engine from
++# before the merge (engine\strata.exe, 0.1.32 fork) with the config saved before it, alternated with the merged one in
++# the same session, tells a slower engine from a slower PC that afternoon.
++PRE_MERGE_CFG = ROOT / "strata-unsloth-ud-q4_k_xl.json.pre-merge"
++
++
++def pre_merge(cfg):
++    old = json.loads(PRE_MERGE_CFG.read_text(encoding="utf-8-sig"))
++    log_path = cfg.get("log")
++    cfg.clear()
++    cfg.update(old)
++    if log_path:
++        cfg["log"] = log_path
++
++
++# merge bisect (2026-10-06, v100_decodebench10): the merged engine decodes ~17% slower than the pre-merge one in the
++# same session (CPU time per CPU-computed expert 2.2 -> 3.1-3.4 ms, V100 GPU wait +1 ms, noisier).  Upstream switches
++# that turn its newer decode paths back off, one group per run, no rebuild:
++VARIANTS.update({
++    "pcie0": ("every card's PCIe share of the misses 0 (--pcie-frac 0): 0.1.40 gives the V100 0.09 on its x4 link, "
++              "0.1.32 gave it 0", {"--pcie-frac": "0"}, {}, None),
++    "decbatch0": ("the decode batching of #a36be1d off (STRATA_DEC_BATCH=0)", {}, {"STRATA_DEC_BATCH": "0"}, None),
++    "shstream0": ("the shared expert on the main stream, not forked (STRATA_SH_STREAM=0)", {}, {"STRATA_SH_STREAM": "0"},
++                  None),
++    "gpu_legacy": ("0.1.40's newer verify-window paths off (multi-token GR, batched KV step, one-token self commit, "
++                   "multi head mix)", {}, {"STRATA_NO_MULTI_GR": "1", "STRATA_NO_BATCH_KV_STEP": "1",
++                                           "STRATA_ONE_TOKEN_COMMIT": "0", "STRATA_HEAD_MIX_MULTI": "0"}, None),
++    "hostlast": ("the host thread on the last physical core (STRATA_HOST_CORE=last; GPU interrupts land on the first)",
++                 {}, {"STRATA_HOST_CORE": "last"}, None),
++})
++# merge fix check (2026-10-06): the fork now hard-pins the host thread again (0.1.32's SetThreadAffinityMask way;
++# STRATA_HOST_CPUSET=1 = 0.1.40's CPU Set selection) and gives a link under 4 GB/s no PCIe share (STRATA_STAGE_PCIE_
++# UPSTREAM=1 = 0.1.40's 0.09); the config pins the async tier's copy thread nowhere (STRATA_ADAPT_JOB_CPU=-1: its
++# default "spare" SMT sibling is a pool worker's here)
++VARIANTS.update({
++    "host_cpuset": ("0.1.40's host placement (STRATA_HOST_CPUSET=1: a CPU Set, not a hard pin)", {},
++                    {"STRATA_HOST_CPUSET": "1"}, None),
++    "stage_pcie_up": ("0.1.40's PCIe share for the V100's x4 link (STRATA_STAGE_PCIE_UPSTREAM=1: 0.09)", {},
++                      {"STRATA_STAGE_PCIE_UPSTREAM": "1"}, None),
++    "job_spare": ("the async tier's copy thread on its default spare SMT sibling (STRATA_ADAPT_JOB_CPU unset)", {}, {},
++                  lambda cfg: cfg.get("env", {}).pop("STRATA_ADAPT_JOB_CPU", None)),
++})
++VARIANTS.update({
++    "pre_merge": ("the engine from before the merge (engine\\strata.exe) with the config saved before it", {}, {},
++                  pre_merge),
++    "pre_merge_end": ("the engine from before the merge again, last", {}, {}, pre_merge),
 +})
 +ENGINE_LINE_KEYS = ("ple io", "page-locked", "locked resident", "decode timing", "decode GPU stages", "strata serve: stage ", "hit rate", "layer split auto",
 +                    "expert cache ", "layer split: CUDA", "strata serve: prompt ", "pcie_frac", "PCIe probe",
-+                    "resident RAM mode", "adaptive", "ERROR", "error", "failed")
++                    "resident RAM mode", "adaptive", "asynchronous", "reads the prompt in", "ERROR", "error", "failed")
 +
 +
 +def chat(tok, text):
@@ -2762,7 +2178,7 @@ index 0000000..859db0d
 +    sys.exit(main())
 diff --git a/tools/v100_disktest.py b/tools/v100_disktest.py
 new file mode 100644
-index 0000000..0e0b0a5
+index 0000000..8a68a1a
 --- /dev/null
 +++ b/tools/v100_disktest.py
 @@ -0,0 +1,332 @@
@@ -3100,10 +2516,10 @@ index 0000000..0e0b0a5
 +    sys.exit(main())
 diff --git a/tools/v100_gputest.py b/tools/v100_gputest.py
 new file mode 100644
-index 0000000..7a2b704
+index 0000000..4375c65
 --- /dev/null
 +++ b/tools/v100_gputest.py
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,141 @@
 +"""V100 fork: the GPU tests, for when the GPUs are free (stop any other GPU program first).
 +
 +1. The kernel parity programs (synthetic data, no model) on each card alone - the V100 first: GPU kernels against
@@ -3129,15 +2545,12 @@ index 0000000..7a2b704
 +# (program, arguments) - every one synthetic; exit code 0 = pass
 +PARITY = [
 +    ("strata-device", []),
-+    ("bf16_gemm_fallback_test", ["cublas"]),
-+    ("bf16_gemm_fallback_test", ["fallback"]),
 +    ("native_expert_parity", ["--synthetic", "q4_K/q5_1"]),
 +    ("native_expert_parity", ["--synthetic", "q4_K/q8_0"]),
 +    ("native_expert_parity", ["--synthetic", "q5_K/q8_0"]),
 +    ("native_expert_parity", ["--synthetic", "q8_0/q8_0"]),
 +    ("native_expert_parity", ["--q5_1-min"]),
 +    ("mmvq_multi_parity", []),
-+    ("prefill_mmq_kquant_test", []),
 +    ("gr_parity", ["--selftest"]),
 +    ("gdn_parity", ["--selftest"]),
 +    ("qsa_parity", ["--selftest"]),
@@ -3218,7 +2631,8 @@ index 0000000..7a2b704
 +    ap = argparse.ArgumentParser()
 +    ap.add_argument("--log", default=str(ROOT / "v100_gputest.log"))
 +    ap.add_argument("--config", default=str(ROOT / "strata-unsloth-ud-q4_k_xl.json"))
-+    ap.add_argument("--build", default=str(ROOT / "build"))
++    from v100_setup import build_dir
++    ap.add_argument("--build", default=str(build_dir()))
 +    ap.add_argument("--parity-only", action="store_true")
 +    ap.add_argument("--bench-only", action="store_true")
 +    ap.add_argument("--variants", help="passed to v100_bench.py")
@@ -3249,7 +2663,7 @@ index 0000000..7a2b704
 +    sys.exit(main())
 diff --git a/tools/v100_longbench.py b/tools/v100_longbench.py
 new file mode 100644
-index 0000000..ef487b3
+index 0000000..7fbeefb
 --- /dev/null
 +++ b/tools/v100_longbench.py
 @@ -0,0 +1,199 @@
@@ -3454,10 +2868,10 @@ index 0000000..ef487b3
 +    sys.exit(main())
 diff --git a/tools/v100_ple_split.py b/tools/v100_ple_split.py
 new file mode 100644
-index 0000000..5ac924d
+index 0000000..09f066a
 --- /dev/null
 +++ b/tools/v100_ple_split.py
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,248 @@
 +"""V100 fork: the PLE n-gram table in a file of its own - NO GPU USED.
 +
 +The engine reads layer 1's n-gram table (per_layer_token_embd.weight, 28.8 GB, in Unsloth's shard 2) with
@@ -3528,12 +2942,14 @@ index 0000000..5ac924d
 +
 +def build_test(log) -> Path | None:
 +    import setup as S
-+    exe = ROOT / "build" / ("ple_reader_test.exe" if WIN else "ple_reader_test")
++    from v100_setup import build_dir
++    bdir = build_dir()   # build-cuda12/ since the upstream 0.1.40 merge, else build/
++    exe = bdir / ("ple_reader_test.exe" if WIN else "ple_reader_test")
 +    cmake = S.find_tool("cmake")
-+    if cmake is None or not (ROOT / "build" / "CMakeCache.txt").exists():
++    if cmake is None or not (bdir / "CMakeCache.txt").exists():
 +        log("  no build folder / cmake: run v100\\1_setup_and_build.bat once first")
 +        return None
-+    cmd = [cmake, "--build", str(ROOT / "build"), "--target", "ple_reader_test", "-j", "4"]
++    cmd = [cmake, "--build", str(bdir), "--target", "ple_reader_test", "-j", "4"]
 +    if WIN:
 +        vcvars = S.find_vcvars()
 +        bat = ROOT / "build-v100-pletest.bat"
@@ -3706,7 +3122,7 @@ index 0000000..5ac924d
 +    sys.exit(main())
 diff --git a/tools/v100_prefillbench.py b/tools/v100_prefillbench.py
 new file mode 100644
-index 0000000..d46d538
+index 0000000..9ab36cc
 --- /dev/null
 +++ b/tools/v100_prefillbench.py
 @@ -0,0 +1,175 @@
@@ -3887,10 +3303,10 @@ index 0000000..d46d538
 +    sys.exit(main())
 diff --git a/tools/v100_setup.py b/tools/v100_setup.py
 new file mode 100644
-index 0000000..8a44ac3
+index 0000000..df6a688
 --- /dev/null
 +++ b/tools/v100_setup.py
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,215 @@
 +"""V100 fork: set up UD-Q4_K_XL on an RTX 4070 Super + Tesla V100 PC, and build the GPU test programs.
 +
 +Uses NO GPU: it only asks nvidia-smi which cards are there, then runs setup (download/pack if needed, compile the
@@ -3914,10 +3330,19 @@ index 0000000..8a44ac3
 +WIN = os.name == "nt"
 +
 +# the GPU test programs the second script runs (all synthetic: no model needed); built next to the engine
-+TEST_TARGETS = ["bf16_gemm_fallback_test", "native_expert_parity", "mmvq_multi_parity", "gr_parity", "gdn_parity",
++TEST_TARGETS = ["native_expert_parity", "mmvq_multi_parity", "gr_parity", "gdn_parity",
 +                "qsa_parity", "kv_q8_parity", "elementwise_parity", "sampler_parity", "router_top10_parity",
 +                "rope_parity", "quantize_act_parity", "shared_expert_parity", "bf16_gemv_parity",
-+                "s_gemv_q8k_parity", "prefill_mmq_kquant_test", "strata-device"]
++                "s_gemv_q8k_parity", "strata-device"]
++
++
++def build_dir() -> Path:
++    """Setup's build folder for this PC's engine: build-cuda12/ (since upstream 0.1.40 a V100 runs the experimental
++    CUDA 12 engine, in engine-cuda12/), else build/ (the fork's builds before the merge)."""
++    for d in ("build-cuda12", "build"):
++        if (ROOT / d / "CMakeCache.txt").exists():
++            return ROOT / d
++    return ROOT / "build-cuda12"
 +
 +
 +class Tee:
@@ -3989,7 +3414,7 @@ index 0000000..8a44ac3
 +    if not a.skip_setup:
 +        cmd = [py, str(ROOT / "setup.py"), "--setup", "--build", "--yes", "--no-start", "--family", "unsloth",
 +               "--model", "UD-Q4_K_XL", "--gpus", order, "--context", str(a.context), "--vision", "no",
-+               "--experimental-speed-projection", "off"]
++               "--experimental-speed-projection", "off", "--cuda", "12", "--no-remote-expert-opt"]
 +        gguf_dir = a.gguf_dir
 +        old_cfg = ROOT / "strata-unsloth-ud-q4_k_xl.json"
 +        if not gguf_dir and old_cfg.exists():
@@ -4014,11 +3439,12 @@ index 0000000..8a44ac3
 +    sys.path.insert(0, str(ROOT))
 +    import setup as S                                      # noqa: E402
 +    cmake, ninja = S.find_tool("cmake"), S.find_tool("ninja")
-+    if not (ROOT / "build" / "CMakeCache.txt").exists() or cmake is None:
-+        log("  no build/CMakeCache.txt (setup did not compile the engine?) - the test programs are not built")
++    bdir = build_dir()
++    if not (bdir / "CMakeCache.txt").exists() or cmake is None:
++        log(f"  no {bdir.name}/CMakeCache.txt (setup did not compile the engine?) - the test programs are not built")
 +        return 1
 +    jobs = str(max(2, (os.cpu_count() or 4) // 2))
-+    build = [cmake, "--build", str(ROOT / "build"), "-j", jobs, "--target", *TEST_TARGETS]
++    build = [cmake, "--build", str(bdir), "-j", jobs, "--target", *TEST_TARGETS]
 +    if WIN:
 +        vcvars = S.find_vcvars()
 +        if vcvars is None:
@@ -4033,7 +3459,7 @@ index 0000000..8a44ac3
 +    log(f"  test programs build exit code {rc}")
 +    exe = ".exe" if WIN else ""
 +    for t in TEST_TARGETS:
-+        p = ROOT / "build" / (t + exe)
++        p = bdir / (t + exe)
 +        log(f"    {'ok     ' if p.exists() else 'MISSING'} {p}")
 +    cfg = ROOT / "strata-unsloth-ud-q4_k_xl.json"
 +    log(f"  config: {cfg} {'(present)' if cfg.exists() else '(MISSING)'}")
@@ -4052,9 +3478,11 @@ index 0000000..8a44ac3
 +        # v100_workload (2026-10-03, a real hour at 30-213K context): new text of 65-768 tokens read batched took 3.6-10 s
 +        # (the V100 streams every routed expert it lacks over its x4 link); the decode windows read ~13 ms a token,
 +        # which is faster up to ~1000 tokens: --short-read 768 (was 64) saves ~165 s an hour of that work
++        # upstream 0.1.40 merge: the fork's adaptive tier without stalls (decode 38.6 -> 52.4 tok/s) is upstream's
++        # --adapt-async 1 now (the same three steps on a worker, per card on a split); it is opt-in there
 +        for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11"), ("--prefill", "auto:32768"),
 +                          ("--adapt-swaps", "32"), ("--spec-min-p", "0.7"),
-+                          ("--short-read", "768")):
++                          ("--short-read", "768"), ("--adapt-async", "1")):
 +            if flag in c["args"]:
 +                c["args"][c["args"].index(flag) + 1] = val
 +            else:
@@ -4062,6 +3490,13 @@ index 0000000..8a44ac3
 +        # clients that ask for "the rest of the context" from their own token estimate (pi after a compaction asked
 +        # 4K over): fit max_tokens to the room left instead of rejecting the request with a 400
 +        c["fit_max_tokens"] = True
++        # --remote-expert-opt is for helper expert caches (not a layer split) and turns --adapt-async off
++        if "--remote-expert-opt" in c["args"]:
++            c["args"].remove("--remote-expert-opt")
++        c["remote_expert_opt"] = False
++        # the async tier's copy thread: its default spot (the last P-core's SMT sibling) is a pool worker's on this
++        # PC (11 workers fill the P-cores' 12 threads but the host's), so it is left to the OS
++        c.setdefault("env", {})["STRATA_ADAPT_JOB_CPU"] = "-1"
 +        for k, v in keep.items():
 +            c.setdefault(k, v)
 +        if isinstance(c.get("gpu"), list) and len(c["gpu"]) == 2:
@@ -4079,7 +3514,7 @@ index 0000000..8a44ac3
 +                log(f"  the PLE table from its own file: {own[0].name}")
 +        cfg.write_text(json.dumps(c, indent=1), encoding="utf-8")
 +        log("  tuned for this PC: --pool-affinity auto --pool-workers 11 --prefill auto:32768 --adapt-swaps 32 "
-+            "--spec-min-p 0.7 --short-read 768, layer_split 20, fit_max_tokens")
++            "--spec-min-p 0.7 --short-read 768 --adapt-async 1, layer_split 20, fit_max_tokens")
 +    if cfg.exists():
 +        log(cfg.read_text(encoding="utf-8"))
 +    return rc
@@ -4089,7 +3524,7 @@ index 0000000..8a44ac3
 +    sys.exit(main())
 diff --git a/tools/v100_workload.py b/tools/v100_workload.py
 new file mode 100644
-index 0000000..f83f9da
+index 0000000..99d514f
 --- /dev/null
 +++ b/tools/v100_workload.py
 @@ -0,0 +1,226 @@
@@ -4321,7 +3756,7 @@ index 0000000..f83f9da
 +    sys.exit(main())
 diff --git a/v100/10_decode_split.bat b/v100/10_decode_split.bat
 new file mode 100644
-index 0000000..c154d74
+index 0000000..a3e802a
 --- /dev/null
 +++ b/v100/10_decode_split.bat
 @@ -0,0 +1,14 @@
@@ -4341,7 +3776,7 @@ index 0000000..c154d74
 +pause
 diff --git a/v100/11_decode_ple.bat b/v100/11_decode_ple.bat
 new file mode 100644
-index 0000000..60621d9
+index 0000000..6310d23
 --- /dev/null
 +++ b/v100/11_decode_ple.bat
 @@ -0,0 +1,13 @@
@@ -4360,7 +3795,7 @@ index 0000000..60621d9
 +pause
 diff --git a/v100/12_decode_throttle.bat b/v100/12_decode_throttle.bat
 new file mode 100644
-index 0000000..ce23d98
+index 0000000..dae69bd
 --- /dev/null
 +++ b/v100/12_decode_throttle.bat
 @@ -0,0 +1,13 @@
@@ -4379,7 +3814,7 @@ index 0000000..ce23d98
 +pause
 diff --git a/v100/13_ple_split.bat b/v100/13_ple_split.bat
 new file mode 100644
-index 0000000..666bb4c
+index 0000000..c043685
 --- /dev/null
 +++ b/v100/13_ple_split.bat
 @@ -0,0 +1,12 @@
@@ -4397,7 +3832,7 @@ index 0000000..666bb4c
 +pause
 diff --git a/v100/14_ple_check.bat b/v100/14_ple_check.bat
 new file mode 100644
-index 0000000..307a05b
+index 0000000..b96ee41
 --- /dev/null
 +++ b/v100/14_ple_check.bat
 @@ -0,0 +1,16 @@
@@ -4419,7 +3854,7 @@ index 0000000..307a05b
 +pause
 diff --git a/v100/15_workload.bat b/v100/15_workload.bat
 new file mode 100644
-index 0000000..2cefe6b
+index 0000000..16f70a8
 --- /dev/null
 +++ b/v100/15_workload.bat
 @@ -0,0 +1,10 @@
@@ -4435,17 +3870,16 @@ index 0000000..2cefe6b
 +pause
 diff --git a/v100/16_expert_cache.bat b/v100/16_expert_cache.bat
 new file mode 100644
-index 0000000..dbeb159
+index 0000000..6b0a316
 --- /dev/null
 +++ b/v100/16_expert_cache.bat
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,18 @@
 +@echo off
 +rem V100 fork, step 16 - the expert caches: your recorded routing replayed, then the adaptive swaps with a budget per card.
 +rem   Part 1 (no GPU): compiles the changed engine file (a few minutes; log v100_setup.log), then replays the routing
 +rem   of your workload runs (runs\workload-*\routing.bin) through a model of the expert caches (5-10 minutes, CPU
 +rem   only).  Log: v100_cachesim.log.
-+rem   Part 2 (USES BOTH GPUs, ~30-35 minutes, nothing compiled): six engine runs - the config, the swap budget per card
-+rem   at 64/32, 96/32, 160/32 and 96/16 (4070 Super/V100), the config again.  Log: v100_decodebench8.log (+ .json).
++rem   (Its GPU part benched per-card swap budgets, --adapt-stage-swaps: no speed gain, dropped in the 0.1.40 merge.)
 +setlocal
 +cd /d "%~dp0.."
 +".venv\Scripts\python.exe" tools\v100_setup.py --context 262144
@@ -4456,15 +3890,92 @@ index 0000000..dbeb159
 +)
 +".venv\Scripts\python.exe" tools\v100_cachesim.py
 +echo.
-+echo Part 1 is done. Part 2 uses both GPUs for about 30-35 minutes. Stop the server and any other GPU program first.
++echo Done. Send v100_cachesim.log back for review.
 +pause
-+".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench8.log --variants baseline,stage64_32,stage96_32,stage160_32,stage96_16,baseline_end %*
+diff --git a/v100/17_merge_check.bat b/v100/17_merge_check.bat
+new file mode 100644
+index 0000000..8b767b0
+--- /dev/null
++++ b/v100/17_merge_check.bat
+@@ -0,0 +1,26 @@
++@echo off
++rem V100 fork, step 17 - the fork merged onto upstream Strata 0.1.40: build it and check it is at least as fast.
++rem   Part 1 (no GPU, ~20-40 minutes, mostly compiling): saves your config as strata-unsloth-ud-q4_k_xl.json.pre-merge,
++rem   then runs setup for the merged code (the CUDA 12 engine now goes in engine-cuda12\, built in build-cuda12\),
++rem   re-applies this PC's tuning and builds the GPU test programs.  Log: v100_setup.log.
++rem   Part 2 (USES BOTH GPUs, ~35-45 minutes): decode - the new config (upstream's asynchronous adaptive tier on),
++rem   the blocking tier, the config again; then prompt reading - a ~120K prompt with every card in 8192-token chunks
++rem   and with the V100 in 32768-token chunks.  Logs: v100_decodebench9.log and v100_prefillbench2.log (+ .json).
++rem   Before the merge: ~57-60 tok/s short chats, ~53-55 after 60K, ~814 tok/s on the 114K prompt.
++setlocal
++cd /d "%~dp0.."
++if exist strata-unsloth-ud-q4_k_xl.json if not exist strata-unsloth-ud-q4_k_xl.json.pre-merge copy /y strata-unsloth-ud-q4_k_xl.json strata-unsloth-ud-q4_k_xl.json.pre-merge >nul
++".venv\Scripts\python.exe" tools\v100_setup.py --context 262144
++if errorlevel 1 (
++  echo Setup or the build failed - send v100_setup.log back for review.
++  pause
++  exit /b 1
++)
 +echo.
-+echo Done. Send v100_cachesim.log and v100_decodebench8.log back for review.
++echo Part 1 is done. Part 2 uses both GPUs for about 35-45 minutes. Stop the server and any other GPU program first.
++pause
++".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench9.log --variants baseline,async_off,baseline_end
++".venv\Scripts\python.exe" tools\v100_prefillbench.py --log v100_prefillbench2.log --variants same8k,v100_32k
++echo.
++echo Done. Send v100_setup.log, v100_decodebench9.log and v100_prefillbench2.log back for review.
++pause
+diff --git a/v100/18_merge_ab.bat b/v100/18_merge_ab.bat
+new file mode 100644
+index 0000000..db93b6d
+--- /dev/null
++++ b/v100/18_merge_ab.bat
+@@ -0,0 +1,18 @@
++@echo off
++rem V100 fork, step 18 - is the merged engine slower, or was the PC slower that afternoon?  USES BOTH GPUs, ~30 minutes,
++rem   nothing is compiled.  Four engine runs, alternating: the engine from before the merge (engine\strata.exe, with the
++rem   config saved as strata-unsloth-ud-q4_k_xl.json.pre-merge), the merged one, the old one again, the merged one again.
++rem   Log: v100_decodebench10.log (+ .json).  Close other programs first (browser tabs, games, anything busy).
++setlocal
++cd /d "%~dp0.."
++if not exist strata-unsloth-ud-q4_k_xl.json.pre-merge (
++  echo strata-unsloth-ud-q4_k_xl.json.pre-merge is missing - it is written by step 17.
++  pause
++  exit /b 1
++)
++echo This uses both GPUs for about 30 minutes. Stop the server and any other GPU program first.
++pause
++".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench10.log --variants pre_merge,baseline,pre_merge_end,baseline_end %*
++echo.
++echo Done. Send v100_decodebench10.log back for review.
++pause
+diff --git a/v100/19_merge_bisect.bat b/v100/19_merge_bisect.bat
+new file mode 100644
+index 0000000..f47f2b5
+--- /dev/null
++++ b/v100/19_merge_bisect.bat
+@@ -0,0 +1,19 @@
++@echo off
++rem V100 fork, step 19 - which part of the merged engine makes it decode slower.  USES BOTH GPUs, ~50 minutes,
++rem   nothing is compiled.  Eight engine runs: the pre-merge engine, the merged one as it is, then the merged one with
++rem   one group of its newer decode paths turned back off per run (PCIe share 0, decode batching off, shared-expert
++rem   stream off, the newer verify-window paths off, the host thread on the last core), the pre-merge engine again.
++rem   Log: v100_decodebench11.log (+ .json).  Close other programs first.
++setlocal
++cd /d "%~dp0.."
++if not exist strata-unsloth-ud-q4_k_xl.json.pre-merge (
++  echo strata-unsloth-ud-q4_k_xl.json.pre-merge is missing - it is written by step 17.
++  pause
++  exit /b 1
++)
++echo This uses both GPUs for about 50 minutes. Stop the server and any other GPU program first.
++pause
++".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench11.log --variants pre_merge,baseline,pcie0,decbatch0,shstream0,gpu_legacy,hostlast,pre_merge_end %*
++echo.
++echo Done. Send v100_decodebench11.log back for review.
 +pause
 diff --git a/v100/1_setup_and_build.bat b/v100/1_setup_and_build.bat
 new file mode 100644
-index 0000000..62fa55b
+index 0000000..56075a9
 --- /dev/null
 +++ b/v100/1_setup_and_build.bat
 @@ -0,0 +1,18 @@
@@ -4486,9 +3997,36 @@ index 0000000..62fa55b
 +echo.
 +echo Done. Send v100_setup.log (in the Strata folder) back for review.
 +pause
+diff --git a/v100/20_merge_fix.bat b/v100/20_merge_fix.bat
+new file mode 100644
+index 0000000..89a02ed
+--- /dev/null
++++ b/v100/20_merge_fix.bat
+@@ -0,0 +1,21 @@
++@echo off
++rem V100 fork, step 20 - the merged engine with the host thread hard-pinned again (as before the merge) and no PCIe
++rem   share for the V100's x4 link.  Part 1 (no GPU, a few minutes): rebuilds the engine (log v100_setup.log).
++rem   Part 2 (USES BOTH GPUs, ~40 minutes): six engine runs - the pre-merge engine, the rebuilt one, then the rebuilt one
++rem   with each fix undone in turn (0.1.40's host placement, 0.1.40's V100 PCIe share, the async copy thread on its old
++rem   spot), the pre-merge engine again.  Log: v100_decodebench12.log (+ .json).  Close other programs first.
++setlocal
++cd /d "%~dp0.."
++".venv\Scripts\python.exe" tools\v100_setup.py --context 262144
++if errorlevel 1 (
++  echo Setup or the build failed - send v100_setup.log back for review.
++  pause
++  exit /b 1
++)
++echo.
++echo Part 1 is done. Part 2 uses both GPUs for about 40 minutes. Stop the server and any other GPU program first.
++pause
++".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench12.log --variants pre_merge,baseline,host_cpuset,stage_pcie_up,job_spare,pre_merge_end %*
++echo.
++echo Done. Send v100_decodebench12.log (and v100_setup.log if anything failed) back for review.
++pause
 diff --git a/v100/2_gpu_tests.bat b/v100/2_gpu_tests.bat
 new file mode 100644
-index 0000000..36dc490
+index 0000000..6ce2f6f
 --- /dev/null
 +++ b/v100/2_gpu_tests.bat
 @@ -0,0 +1,14 @@
@@ -4508,7 +4046,7 @@ index 0000000..36dc490
 +pause
 diff --git a/v100/3_start_server.bat b/v100/3_start_server.bat
 new file mode 100644
-index 0000000..af1dd4d
+index 0000000..6906d38
 --- /dev/null
 +++ b/v100/3_start_server.bat
 @@ -0,0 +1,7 @@
@@ -4521,7 +4059,7 @@ index 0000000..af1dd4d
 +pause
 diff --git a/v100/4_long_context.bat b/v100/4_long_context.bat
 new file mode 100644
-index 0000000..888c99e
+index 0000000..bcf9dfc
 --- /dev/null
 +++ b/v100/4_long_context.bat
 @@ -0,0 +1,26 @@
@@ -4553,7 +4091,7 @@ index 0000000..888c99e
 +pause
 diff --git a/v100/5_prompt_chunks.bat b/v100/5_prompt_chunks.bat
 new file mode 100644
-index 0000000..a3d6087
+index 0000000..bd063ff
 --- /dev/null
 +++ b/v100/5_prompt_chunks.bat
 @@ -0,0 +1,22 @@
@@ -4581,7 +4119,7 @@ index 0000000..a3d6087
 +pause
 diff --git a/v100/6_decode.bat b/v100/6_decode.bat
 new file mode 100644
-index 0000000..9b0b6a5
+index 0000000..2628c0f
 --- /dev/null
 +++ b/v100/6_decode.bat
 @@ -0,0 +1,14 @@
@@ -4601,7 +4139,7 @@ index 0000000..9b0b6a5
 +pause
 diff --git a/v100/7_decode_async.bat b/v100/7_decode_async.bat
 new file mode 100644
-index 0000000..4dc9cf6
+index 0000000..5a80906
 --- /dev/null
 +++ b/v100/7_decode_async.bat
 @@ -0,0 +1,22 @@
@@ -4629,7 +4167,7 @@ index 0000000..4dc9cf6
 +pause
 diff --git a/v100/8_decode_tuning.bat b/v100/8_decode_tuning.bat
 new file mode 100644
-index 0000000..f2df90d
+index 0000000..778a370
 --- /dev/null
 +++ b/v100/8_decode_tuning.bat
 @@ -0,0 +1,22 @@
@@ -4657,7 +4195,7 @@ index 0000000..f2df90d
 +pause
 diff --git a/v100/9_disk_test.bat b/v100/9_disk_test.bat
 new file mode 100644
-index 0000000..d29b3a9
+index 0000000..fb0e153
 --- /dev/null
 +++ b/v100/9_disk_test.bat
 @@ -0,0 +1,10 @@

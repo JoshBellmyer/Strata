@@ -23,15 +23,12 @@ EXE = ".exe" if os.name == "nt" else ""
 # (program, arguments) - every one synthetic; exit code 0 = pass
 PARITY = [
     ("strata-device", []),
-    ("bf16_gemm_fallback_test", ["cublas"]),
-    ("bf16_gemm_fallback_test", ["fallback"]),
     ("native_expert_parity", ["--synthetic", "q4_K/q5_1"]),
     ("native_expert_parity", ["--synthetic", "q4_K/q8_0"]),
     ("native_expert_parity", ["--synthetic", "q5_K/q8_0"]),
     ("native_expert_parity", ["--synthetic", "q8_0/q8_0"]),
     ("native_expert_parity", ["--q5_1-min"]),
     ("mmvq_multi_parity", []),
-    ("prefill_mmq_kquant_test", []),
     ("gr_parity", ["--selftest"]),
     ("gdn_parity", ["--selftest"]),
     ("qsa_parity", ["--selftest"]),
@@ -112,7 +109,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--log", default=str(ROOT / "v100_gputest.log"))
     ap.add_argument("--config", default=str(ROOT / "strata-unsloth-ud-q4_k_xl.json"))
-    ap.add_argument("--build", default=str(ROOT / "build"))
+    from v100_setup import build_dir
+    ap.add_argument("--build", default=str(build_dir()))
     ap.add_argument("--parity-only", action="store_true")
     ap.add_argument("--bench-only", action="store_true")
     ap.add_argument("--variants", help="passed to v100_bench.py")

@@ -68,12 +68,14 @@ def find_table_shard(native: Path):
 
 def build_test(log) -> Path | None:
     import setup as S
-    exe = ROOT / "build" / ("ple_reader_test.exe" if WIN else "ple_reader_test")
+    from v100_setup import build_dir
+    bdir = build_dir()   # build-cuda12/ since the upstream 0.1.40 merge, else build/
+    exe = bdir / ("ple_reader_test.exe" if WIN else "ple_reader_test")
     cmake = S.find_tool("cmake")
-    if cmake is None or not (ROOT / "build" / "CMakeCache.txt").exists():
+    if cmake is None or not (bdir / "CMakeCache.txt").exists():
         log("  no build folder / cmake: run v100\\1_setup_and_build.bat once first")
         return None
-    cmd = [cmake, "--build", str(ROOT / "build"), "--target", "ple_reader_test", "-j", "4"]
+    cmd = [cmake, "--build", str(bdir), "--target", "ple_reader_test", "-j", "4"]
     if WIN:
         vcvars = S.find_vcvars()
         bat = ROOT / "build-v100-pletest.bat"
