@@ -154,6 +154,53 @@ VARIANTS.update({
 VARIANTS.update({
     "async_off": ("upstream's blocking adaptive tier (--adapt-async 0)", {"--adapt-async": "0"}, {}, None),
 })
+# merge A/B (2026-10-06): decode measured slower after the merge (CPU expert time per window ~2x).  The engine from
+# before the merge (engine\strata.exe, 0.1.32 fork) with the config saved before it, alternated with the merged one in
+# the same session, tells a slower engine from a slower PC that afternoon.
+PRE_MERGE_CFG = ROOT / "strata-unsloth-ud-q4_k_xl.json.pre-merge"
+
+
+def pre_merge(cfg):
+    old = json.loads(PRE_MERGE_CFG.read_text(encoding="utf-8-sig"))
+    log_path = cfg.get("log")
+    cfg.clear()
+    cfg.update(old)
+    if log_path:
+        cfg["log"] = log_path
+
+
+# merge bisect (2026-10-06, v100_decodebench10): the merged engine decodes ~17% slower than the pre-merge one in the
+# same session (CPU time per CPU-computed expert 2.2 -> 3.1-3.4 ms, V100 GPU wait +1 ms, noisier).  Upstream switches
+# that turn its newer decode paths back off, one group per run, no rebuild:
+VARIANTS.update({
+    "pcie0": ("every card's PCIe share of the misses 0 (--pcie-frac 0): 0.1.40 gives the V100 0.09 on its x4 link, "
+              "0.1.32 gave it 0", {"--pcie-frac": "0"}, {}, None),
+    "decbatch0": ("the decode batching of #a36be1d off (STRATA_DEC_BATCH=0)", {}, {"STRATA_DEC_BATCH": "0"}, None),
+    "shstream0": ("the shared expert on the main stream, not forked (STRATA_SH_STREAM=0)", {}, {"STRATA_SH_STREAM": "0"},
+                  None),
+    "gpu_legacy": ("0.1.40's newer verify-window paths off (multi-token GR, batched KV step, one-token self commit, "
+                   "multi head mix)", {}, {"STRATA_NO_MULTI_GR": "1", "STRATA_NO_BATCH_KV_STEP": "1",
+                                           "STRATA_ONE_TOKEN_COMMIT": "0", "STRATA_HEAD_MIX_MULTI": "0"}, None),
+    "hostlast": ("the host thread on the last physical core (STRATA_HOST_CORE=last; GPU interrupts land on the first)",
+                 {}, {"STRATA_HOST_CORE": "last"}, None),
+})
+# merge fix check (2026-10-06): the fork now hard-pins the host thread again (0.1.32's SetThreadAffinityMask way;
+# STRATA_HOST_CPUSET=1 = 0.1.40's CPU Set selection) and gives a link under 4 GB/s no PCIe share (STRATA_STAGE_PCIE_
+# UPSTREAM=1 = 0.1.40's 0.09); the config pins the async tier's copy thread nowhere (STRATA_ADAPT_JOB_CPU=-1: its
+# default "spare" SMT sibling is a pool worker's here)
+VARIANTS.update({
+    "host_cpuset": ("0.1.40's host placement (STRATA_HOST_CPUSET=1: a CPU Set, not a hard pin)", {},
+                    {"STRATA_HOST_CPUSET": "1"}, None),
+    "stage_pcie_up": ("0.1.40's PCIe share for the V100's x4 link (STRATA_STAGE_PCIE_UPSTREAM=1: 0.09)", {},
+                      {"STRATA_STAGE_PCIE_UPSTREAM": "1"}, None),
+    "job_spare": ("the async tier's copy thread on its default spare SMT sibling (STRATA_ADAPT_JOB_CPU unset)", {}, {},
+                  lambda cfg: cfg.get("env", {}).pop("STRATA_ADAPT_JOB_CPU", None)),
+})
+VARIANTS.update({
+    "pre_merge": ("the engine from before the merge (engine\\strata.exe) with the config saved before it", {}, {},
+                  pre_merge),
+    "pre_merge_end": ("the engine from before the merge again, last", {}, {}, pre_merge),
+})
 ENGINE_LINE_KEYS = ("ple io", "page-locked", "locked resident", "decode timing", "decode GPU stages", "strata serve: stage ", "hit rate", "layer split auto",
                     "expert cache ", "layer split: CUDA", "strata serve: prompt ", "pcie_frac", "PCIe probe",
                     "resident RAM mode", "adaptive", "asynchronous", "reads the prompt in", "ERROR", "error", "failed")

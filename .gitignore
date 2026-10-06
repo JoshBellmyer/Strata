@@ -66,3 +66,6 @@ build-vision-cuda12.bat
 /runs/
 # the build scripts tools/v100_setup.py and tools/v100_ple_split.py write
 /build-v100-*.bat
+# V100 fork: config backups (step 17, setup) and bench results (v100_*bench*.json beside their .log)
+/strata-*.json.*
+/v100_*.json

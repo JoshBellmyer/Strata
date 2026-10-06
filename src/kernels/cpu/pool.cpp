@@ -362,6 +362,29 @@ ThreadAffinity pin_current_thread(int core) {
     if (core < 0) return {};
 #if defined(_WIN32)
     ThreadAffinity previous;
+    // V100 fork: the host thread is HARD-pinned to its core, as 0.1.32 did (SetThreadAffinityMask).  0.1.40's CPU
+    // Set selection (#626) is a preference the scheduler may leave: on a hybrid i5-13600K the host - which drains
+    // expert jobs and spins between them - then also ran beside the pool's workers, and the CPU path took ~40% longer
+    // per expert, run to run uneven (v100_decodebench10/11: 2.2 -> 3.1-4.1 ms per CPU expert, decode 59 -> 45-52
+    // tok/s).  STRATA_HOST_CPUSET=1 keeps upstream's CPU Set selection.
+    static const bool cpuset = [] {
+        const char* v = std::getenv("STRATA_HOST_CPUSET");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!cpuset) {
+        GROUP_AFFINITY target{}, prev{};
+        target.Group = (WORD) (core / 64);
+        target.Mask = KAFFINITY(1) << (core & 63);
+        if (SetThreadGroupAffinity(GetCurrentThread(), &target, &prev)) {
+            previous.hard = true;
+            previous.prev_group = prev.Group;
+            previous.prev_mask = (unsigned long long) prev.Mask;
+            previous.valid = true;
+            return previous;
+        }
+        std::fprintf(stderr, "strata cpu pool: host affinity for processor %d failed: %lu; trying a CPU Set\n", core,
+                     (unsigned long) GetLastError());
+    }
     ULONG target = 0;
     if (!detail::get_thread_cpu_sets(previous.cpu_sets) || !detail::cpu_set_for_core(core, target) ||
         !SetThreadSelectedCpuSets(GetCurrentThread(), &target, 1)) {
@@ -387,6 +410,14 @@ ThreadAffinity pin_current_thread(int core) {
 void restore_thread_affinity(const ThreadAffinity& previous) {
     if (!previous.valid) return;
 #if defined(_WIN32)
+    if (previous.hard) {   // V100 fork: the hard pin's previous group affinity
+        GROUP_AFFINITY prev{};
+        prev.Group = (WORD) previous.prev_group;
+        prev.Mask = (KAFFINITY) previous.prev_mask;
+        if (prev.Mask == 0 || !SetThreadGroupAffinity(GetCurrentThread(), &prev, nullptr))
+            std::fprintf(stderr, "strata cpu pool: host affinity restoration failed: %lu\n", (unsigned long) GetLastError());
+        return;
+    }
     // Clearing an originally empty selection restores process-default/all-group eligibility without
     // turning the caller's implicit Windows 11 affinity into an explicit single-group hard mask.
     if (!SetThreadSelectedCpuSets(GetCurrentThread(), previous.cpu_sets.empty() ? nullptr : previous.cpu_sets.data(),

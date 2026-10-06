@@ -1,8 +1,8 @@
 diff --git a/.gitignore b/.gitignore
-index acca09f..285ad98 100644
+index acca09f..307aa8f 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -61,3 +61,8 @@ build-vision-cuda12.bat
+@@ -61,3 +61,11 @@ build-vision-cuda12.bat
  
  /.ccache/
  /.rocm-win/
@@ -11,6 +11,9 @@ index acca09f..285ad98 100644
 +/runs/
 +# the build scripts tools/v100_setup.py and tools/v100_ple_split.py write
 +/build-v100-*.bat
++# V100 fork: config backups (step 17, setup) and bench results (v100_*bench*.json beside their .log)
++/strata-*.json.*
++/v100_*.json
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index cd60517..dbc8760 100644
 --- a/CMakeLists.txt
@@ -107,10 +110,10 @@ index 0000000..52dc0df
 +A different architecture or file format needs more work than this.
 diff --git a/docs/V100.md b/docs/V100.md
 new file mode 100644
-index 0000000..5a2b327
+index 0000000..db4ed9a
 --- /dev/null
 +++ b/docs/V100.md
-@@ -0,0 +1,386 @@
+@@ -0,0 +1,413 @@
 +# Tesla V100 + RTX 4070 Super + 96 GB RAM (this fork)
 +
 +This fork runs Unsloth's **UD-Q4_K_XL** of Qwen3.8-Flash-Next ([UNSLOTH_Q4.md](UNSLOTH_Q4.md)) on one specific PC:
@@ -177,6 +180,33 @@ index 0000000..5a2b327
 +and turns `--adapt-async` off) and adds `--adapt-async 1`. `v100\17_merge_check.bat` builds the merged engine and
 +compares decode and prompt speed with the numbers below. The sections after this one describe the fork as it was on
 +0.1.32.
++
++### The decode regression after the merge, and its fix (2026-10-06)
++
++The merged engine read prompts faster (a ~116K-token prompt 878 vs 814 tok/s, 60K in 62-63 s vs 67) but wrote
++15-20% slower, unevenly: the CPU took ~40% longer per expert it computed (2.2 -> 3.1-4.7 ms) with the same experts
++to compute. Benches 10 and 11 ran the pre-merge engine and the merged one alternately in one session (so not the PC)
++and turned upstream's newer decode paths off one at a time (none fixed it). The cause: upstream #626 replaced the host
++thread's hard pin (`SetThreadAffinityMask`) with a Windows CPU Set selection, a preference the scheduler may leave -
++and the host drains expert jobs and spins between them, so off its core it competes with the pool's workers (0.1.32's
++own comment measured that at ~35% of the CPU path). The fork pins it hard again (`pool.cpp`;
++`STRATA_HOST_CPUSET=1` = upstream's selection), gives the V100's x4 link no PCIe share again (a link under 4 GB/s;
++`STRATA_STAGE_PCIE_UPSTREAM=1` = upstream's 0.09) and leaves the async tier's copy thread unpinned
++(`STRATA_ADAPT_JOB_CPU=-1` in the config: its default spot is a pool worker's SMT sibling here).
++
++`v100_decodebench12.log` (one session):
++
++| | Short chats | After 60K | ms/window | CPU ms per CPU expert |
++| --- | ---: | ---: | ---: | ---: |
++| pre-merge engine (0.1.32 fork) | 59.2 | 58.1 | 40.8 | 2.21 |
++| **merged + fix** | **66.9** | **63.1** | **37.1** | 2.22 |
++| merged + fix, host on a CPU Set (upstream) | 36.4 | 41.3 | 64.0 | 4.74 |
++| merged + fix, V100 PCIe share 0.09 (upstream) | 66.0 | 61.7 | 37.7 | 2.25 |
++| merged + fix, copy thread on its old spot | 66.3 | 62.8 | 37.6 | 2.26 |
++| pre-merge engine again | 60.6 | 57.3 | 40.7 | 2.22 |
++
++With the host pinned, 0.1.40's decode work (the V100's stage: 12.4 ms of GPU wait per window against 14.0) makes the
++merged engine 9-13% faster than the fork was, on top of its faster prompts.
 +
 +## What changed in the engine
 +
@@ -520,6 +550,21 @@ index 3eda5a0..47449a3 100644
      bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered
      uint64_t complement_pin_limit_ = 0;
      uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
+diff --git a/include/strata/kernels/cpu/pool.hpp b/include/strata/kernels/cpu/pool.hpp
+index 1b25493..5b2ee19 100644
+--- a/include/strata/kernels/cpu/pool.hpp
++++ b/include/strata/kernels/cpu/pool.hpp
+@@ -120,6 +120,10 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAff
+ struct ThreadAffinity {
+ #if defined(_WIN32)
+     std::vector<unsigned long> cpu_sets;
++    // V100 fork: the hard pin (the default here, as 0.1.32): the previous group affinity, restored as it was
++    bool hard = false;
++    unsigned short prev_group = 0;
++    unsigned long long prev_mask = 0;
+ #else
+     std::vector<unsigned long> mask;
+ #endif
 diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
 index 037385a..c37fe6c 100644
 --- a/include/strata/prefill/prefill.hpp
@@ -637,6 +682,55 @@ index d0ff201..868ab30 100644
          xstage_pinned_ = true;
      } else {
          (void) cudaGetLastError();
+diff --git a/src/kernels/cpu/pool.cpp b/src/kernels/cpu/pool.cpp
+index 69411ee..0cc57d3 100644
+--- a/src/kernels/cpu/pool.cpp
++++ b/src/kernels/cpu/pool.cpp
+@@ -362,6 +362,29 @@ ThreadAffinity pin_current_thread(int core) {
+     if (core < 0) return {};
+ #if defined(_WIN32)
+     ThreadAffinity previous;
++    // V100 fork: the host thread is HARD-pinned to its core, as 0.1.32 did (SetThreadAffinityMask).  0.1.40's CPU
++    // Set selection (#626) is a preference the scheduler may leave: on a hybrid i5-13600K the host - which drains
++    // expert jobs and spins between them - then also ran beside the pool's workers, and the CPU path took ~40% longer
++    // per expert, run to run uneven (v100_decodebench10/11: 2.2 -> 3.1-4.1 ms per CPU expert, decode 59 -> 45-52
++    // tok/s).  STRATA_HOST_CPUSET=1 keeps upstream's CPU Set selection.
++    static const bool cpuset = [] {
++        const char* v = std::getenv("STRATA_HOST_CPUSET");
++        return v != nullptr && v[0] == '1';
++    }();
++    if (!cpuset) {
++        GROUP_AFFINITY target{}, prev{};
++        target.Group = (WORD) (core / 64);
++        target.Mask = KAFFINITY(1) << (core & 63);
++        if (SetThreadGroupAffinity(GetCurrentThread(), &target, &prev)) {
++            previous.hard = true;
++            previous.prev_group = prev.Group;
++            previous.prev_mask = (unsigned long long) prev.Mask;
++            previous.valid = true;
++            return previous;
++        }
++        std::fprintf(stderr, "strata cpu pool: host affinity for processor %d failed: %lu; trying a CPU Set\n", core,
++                     (unsigned long) GetLastError());
++    }
+     ULONG target = 0;
+     if (!detail::get_thread_cpu_sets(previous.cpu_sets) || !detail::cpu_set_for_core(core, target) ||
+         !SetThreadSelectedCpuSets(GetCurrentThread(), &target, 1)) {
+@@ -387,6 +410,14 @@ ThreadAffinity pin_current_thread(int core) {
+ void restore_thread_affinity(const ThreadAffinity& previous) {
+     if (!previous.valid) return;
+ #if defined(_WIN32)
++    if (previous.hard) {   // V100 fork: the hard pin's previous group affinity
++        GROUP_AFFINITY prev{};
++        prev.Group = (WORD) previous.prev_group;
++        prev.Mask = (KAFFINITY) previous.prev_mask;
++        if (prev.Mask == 0 || !SetThreadGroupAffinity(GetCurrentThread(), &prev, nullptr))
++            std::fprintf(stderr, "strata cpu pool: host affinity restoration failed: %lu\n", (unsigned long) GetLastError());
++        return;
++    }
+     // Clearing an originally empty selection restores process-default/all-group eligibility without
+     // turning the caller's implicit Windows 11 affinity into an explicit single-group hard mask.
+     if (!SetThreadSelectedCpuSets(GetCurrentThread(), previous.cpu_sets.empty() ? nullptr : previous.cpu_sets.data(),
 diff --git a/src/ngram/ple_reader_test.cpp b/src/ngram/ple_reader_test.cpp
 index 9208470..84a1b11 100644
 --- a/src/ngram/ple_reader_test.cpp
@@ -877,10 +971,25 @@ index 7b53ac9..89cd915 100644
                               "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                               "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
 diff --git a/src/program/generate.cpp b/src/program/generate.cpp
-index 3b551f3..d361630 100644
+index 3b551f3..5376366 100644
 --- a/src/program/generate.cpp
 +++ b/src/program/generate.cpp
-@@ -5464,6 +5464,17 @@ int main(int argc, char** argv) {
+@@ -2997,6 +2997,14 @@ int main(int argc, char** argv) {
+             std::string bursts;
+             const double bw = probe_pcie_h2d_gbps(&bursts);
+             if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
++            // V100 fork: a link under 4 GB/s (the V100's PCIe 3.0 x4) takes no share, as in 0.1.32: 0.1.40 gives it
++            // 0.09, and its stage's CPU and GPU time both rose (v100_decodebench11, pcie0).  STRATA_STAGE_PCIE_UPSTREAM=1
++            // keeps 0.1.40's rule.
++            static const bool stage_pcie_upstream = [] {
++                const char* v = std::getenv("STRATA_STAGE_PCIE_UPSTREAM");
++                return v != nullptr && v[0] == '1';
++            }();
++            if (bw > 0.0 && bw < 4.0 && !stage_pcie_upstream) st.pcie_frac = 0.0;
+             std::fprintf(stderr, "strata generate: layer split: CUDA%d PCIe probe %.1f GB/s (best of %s) -> pcie_frac "
+                                  "%.2f\n", st.dev, bw, bursts.c_str(), st.pcie_frac);
+         }
+@@ -5464,6 +5472,17 @@ int main(int argc, char** argv) {
              for (int64_t l = st->lb; l < st->le; ++l)
                  for (int64_t e = 0; e < g.n_expert; ++e)
                      if (st->cache.slot_of(l, e) >= 0) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
@@ -898,7 +1007,7 @@ index 3b551f3..d361630 100644
          const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
          bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
                                                      o.resident_headroom, o.resident_budget, &rank_all);
-@@ -5572,6 +5583,8 @@ int main(int argc, char** argv) {
+@@ -5572,6 +5591,8 @@ int main(int argc, char** argv) {
              int32_t first_now = -1;        // where its buffers are laid out now
              int64_t lent_chunk = 0;
              std::vector<std::pair<int32_t, int32_t>> lent;
@@ -907,7 +1016,7 @@ index 3b551f3..d361630 100644
          };
          // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
          // per layer), otherwise max_blob each.
-@@ -5753,8 +5766,49 @@ int main(int argc, char** argv) {
+@@ -5753,8 +5774,49 @@ int main(int argc, char** argv) {
                      std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens so its buffers fit in "
                                           "every expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
                  o.prefill_chunk = chunk;
@@ -958,7 +1067,7 @@ index 3b551f3..d361630 100644
                      p.first_now = p.first;
                  }
                  // #340: a split stage whose card still has room for the chunk's buffers (its cache already holds
-@@ -5772,7 +5826,7 @@ int main(int argc, char** argv) {
+@@ -5772,7 +5834,7 @@ int main(int argc, char** argv) {
                          const strata::core::OnDevice on(p.dev);
                          size_t fb = 0, tb = 0;
                          if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
@@ -967,7 +1076,7 @@ index 3b551f3..d361630 100644
                          if ((uint64_t) fb >= need + (3ull << 29)) {
                              std::fprintf(stderr, "strata serve:   CUDA%d keeps its own prompt buffers (%.2f GiB of "
                                                   "%.2f GiB free): no loan\n", p.dev < 0 ? 0 : p.dev,
-@@ -5823,6 +5877,26 @@ int main(int argc, char** argv) {
+@@ -5823,6 +5885,26 @@ int main(int argc, char** argv) {
          // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned (#253) a
          // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
          // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
@@ -994,7 +1103,7 @@ index 3b551f3..d361630 100644
          auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
              for (size_t i = 0; i < stages.size(); ++i) {
                  GpuStage& st = *stages[i];
-@@ -5835,7 +5909,7 @@ int main(int argc, char** argv) {
+@@ -5835,7 +5917,7 @@ int main(int argc, char** argv) {
                      sb = st.cache.device_slot(pf_parts[i + 1].first);
                      sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                  }
@@ -1003,7 +1112,7 @@ index 3b551f3..d361630 100644
                                  err, sb, sbb)) {
                      err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
                      return err.find("do not fit") != std::string::npos ? 2 : 1;
-@@ -5860,7 +5934,10 @@ int main(int argc, char** argv) {
+@@ -5860,7 +5942,10 @@ int main(int argc, char** argv) {
                      const strata::core::OnDevice on(dev);
                      size_t fb = 0, tb = 0;
                      cudaMemGetInfo(&fb, &tb);
@@ -1015,7 +1124,7 @@ index 3b551f3..d361630 100644
                      if (need + kHeadroom > (int64_t) fb) {
                          dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
                          return false;
-@@ -5870,6 +5947,7 @@ int main(int argc, char** argv) {
+@@ -5870,6 +5955,7 @@ int main(int argc, char** argv) {
              };
              int dev = 0;
              int64_t need = 0, fb = 0;
@@ -1023,7 +1132,7 @@ index 3b551f3..d361630 100644
              if (!own_fits(o.prefill_chunk, dev, need, fb)) {
                  int64_t c = 0;
                  for (const int64_t s : kStepChunks) {
-@@ -5882,12 +5960,30 @@ int main(int argc, char** argv) {
+@@ -5882,12 +5968,30 @@ int main(int argc, char** argv) {
                                           "%lld MiB free: %lld-token chunks\n", (long long) o.prefill_chunk,
                                   (long long) (need >> 20), dev, (long long) (fb >> 20), (long long) c);
                      o.prefill_chunk = c;
@@ -1054,7 +1163,7 @@ index 3b551f3..d361630 100644
              int64_t next = 0;
              for (const int64_t c : kStepChunks)
                  if (c < o.prefill_chunk) { next = c; break; }
-@@ -5903,6 +5999,7 @@ int main(int argc, char** argv) {
+@@ -5903,6 +6007,7 @@ int main(int argc, char** argv) {
                  sp.reset();
                  (void) cudaGetLastError();
                  o.prefill_chunk = next;
@@ -1062,7 +1171,7 @@ index 3b551f3..d361630 100644
                  if (any_loan) {                  // smaller loans for the smaller chunk
                      for (PfPart& p : pf_parts)
                          if (p.first >= 0) {
-@@ -8726,17 +8823,25 @@ int main(int argc, char** argv) {
+@@ -8726,17 +8831,25 @@ int main(int argc, char** argv) {
                  const auto t_ln = Clock::now();
                  // what this segment needs, capped by the configured chunk: a request lends only what its own
                  // prompt needs, so a large chunk costs a short prompt nothing
@@ -1093,7 +1202,7 @@ index 3b551f3..d361630 100644
                      if (!p.lent.empty()) {
                          if (want <= p.lent_chunk) continue;            // its current loan already covers this
                          // ONLY this participant's loan goes back: `refill` would return the other participants'
-@@ -8766,7 +8871,7 @@ int main(int argc, char** argv) {
+@@ -8766,7 +8879,7 @@ int main(int argc, char** argv) {
                      int64_t n_lent = 0;
                      for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
                      std::fprintf(stderr, "strata trace: lent %lld slots for %lld tokens in %.1f ms\n", (long long) n_lent,
@@ -1102,7 +1211,7 @@ index 3b551f3..d361630 100644
                      std::fflush(stderr);
                  }
                  return true;
-@@ -10021,6 +10126,37 @@ int main(int argc, char** argv) {
+@@ -10021,6 +10134,37 @@ int main(int argc, char** argv) {
                               100.0 * (double) req_hits / (double) req_look,
                               (long long) req_hits, (long long) req_look, off);
              }
@@ -1728,10 +1837,10 @@ index 0000000..2269d3d
 +    raise SystemExit(main())
 diff --git a/tools/v100_decodebench.py b/tools/v100_decodebench.py
 new file mode 100644
-index 0000000..30502f2
+index 0000000..286e4fc
 --- /dev/null
 +++ b/tools/v100_decodebench.py
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,335 @@
 +"""V100 fork: where the decode (writing) time goes on the 4070 Super + V100 split, and what changes it.
 +
 +Every variant restarts the engine with one change against the config (strata-unsloth-ud-q4_k_xl.json, 256K context)
@@ -1887,6 +1996,53 @@ index 0000000..30502f2
 +# its blocking one
 +VARIANTS.update({
 +    "async_off": ("upstream's blocking adaptive tier (--adapt-async 0)", {"--adapt-async": "0"}, {}, None),
++})
++# merge A/B (2026-10-06): decode measured slower after the merge (CPU expert time per window ~2x).  The engine from
++# before the merge (engine\strata.exe, 0.1.32 fork) with the config saved before it, alternated with the merged one in
++# the same session, tells a slower engine from a slower PC that afternoon.
++PRE_MERGE_CFG = ROOT / "strata-unsloth-ud-q4_k_xl.json.pre-merge"
++
++
++def pre_merge(cfg):
++    old = json.loads(PRE_MERGE_CFG.read_text(encoding="utf-8-sig"))
++    log_path = cfg.get("log")
++    cfg.clear()
++    cfg.update(old)
++    if log_path:
++        cfg["log"] = log_path
++
++
++# merge bisect (2026-10-06, v100_decodebench10): the merged engine decodes ~17% slower than the pre-merge one in the
++# same session (CPU time per CPU-computed expert 2.2 -> 3.1-3.4 ms, V100 GPU wait +1 ms, noisier).  Upstream switches
++# that turn its newer decode paths back off, one group per run, no rebuild:
++VARIANTS.update({
++    "pcie0": ("every card's PCIe share of the misses 0 (--pcie-frac 0): 0.1.40 gives the V100 0.09 on its x4 link, "
++              "0.1.32 gave it 0", {"--pcie-frac": "0"}, {}, None),
++    "decbatch0": ("the decode batching of #a36be1d off (STRATA_DEC_BATCH=0)", {}, {"STRATA_DEC_BATCH": "0"}, None),
++    "shstream0": ("the shared expert on the main stream, not forked (STRATA_SH_STREAM=0)", {}, {"STRATA_SH_STREAM": "0"},
++                  None),
++    "gpu_legacy": ("0.1.40's newer verify-window paths off (multi-token GR, batched KV step, one-token self commit, "
++                   "multi head mix)", {}, {"STRATA_NO_MULTI_GR": "1", "STRATA_NO_BATCH_KV_STEP": "1",
++                                           "STRATA_ONE_TOKEN_COMMIT": "0", "STRATA_HEAD_MIX_MULTI": "0"}, None),
++    "hostlast": ("the host thread on the last physical core (STRATA_HOST_CORE=last; GPU interrupts land on the first)",
++                 {}, {"STRATA_HOST_CORE": "last"}, None),
++})
++# merge fix check (2026-10-06): the fork now hard-pins the host thread again (0.1.32's SetThreadAffinityMask way;
++# STRATA_HOST_CPUSET=1 = 0.1.40's CPU Set selection) and gives a link under 4 GB/s no PCIe share (STRATA_STAGE_PCIE_
++# UPSTREAM=1 = 0.1.40's 0.09); the config pins the async tier's copy thread nowhere (STRATA_ADAPT_JOB_CPU=-1: its
++# default "spare" SMT sibling is a pool worker's here)
++VARIANTS.update({
++    "host_cpuset": ("0.1.40's host placement (STRATA_HOST_CPUSET=1: a CPU Set, not a hard pin)", {},
++                    {"STRATA_HOST_CPUSET": "1"}, None),
++    "stage_pcie_up": ("0.1.40's PCIe share for the V100's x4 link (STRATA_STAGE_PCIE_UPSTREAM=1: 0.09)", {},
++                      {"STRATA_STAGE_PCIE_UPSTREAM": "1"}, None),
++    "job_spare": ("the async tier's copy thread on its default spare SMT sibling (STRATA_ADAPT_JOB_CPU unset)", {}, {},
++                  lambda cfg: cfg.get("env", {}).pop("STRATA_ADAPT_JOB_CPU", None)),
++})
++VARIANTS.update({
++    "pre_merge": ("the engine from before the merge (engine\\strata.exe) with the config saved before it", {}, {},
++                  pre_merge),
++    "pre_merge_end": ("the engine from before the merge again, last", {}, {}, pre_merge),
 +})
 +ENGINE_LINE_KEYS = ("ple io", "page-locked", "locked resident", "decode timing", "decode GPU stages", "strata serve: stage ", "hit rate", "layer split auto",
 +                    "expert cache ", "layer split: CUDA", "strata serve: prompt ", "pcie_frac", "PCIe probe",
@@ -3147,10 +3303,10 @@ index 0000000..9ab36cc
 +    sys.exit(main())
 diff --git a/tools/v100_setup.py b/tools/v100_setup.py
 new file mode 100644
-index 0000000..144ca2b
+index 0000000..df6a688
 --- /dev/null
 +++ b/tools/v100_setup.py
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,215 @@
 +"""V100 fork: set up UD-Q4_K_XL on an RTX 4070 Super + Tesla V100 PC, and build the GPU test programs.
 +
 +Uses NO GPU: it only asks nvidia-smi which cards are there, then runs setup (download/pack if needed, compile the
@@ -3338,6 +3494,9 @@ index 0000000..144ca2b
 +        if "--remote-expert-opt" in c["args"]:
 +            c["args"].remove("--remote-expert-opt")
 +        c["remote_expert_opt"] = False
++        # the async tier's copy thread: its default spot (the last P-core's SMT sibling) is a pool worker's on this
++        # PC (11 workers fill the P-cores' 12 threads but the host's), so it is left to the OS
++        c.setdefault("env", {})["STRATA_ADAPT_JOB_CPU"] = "-1"
 +        for k, v in keep.items():
 +            c.setdefault(k, v)
 +        if isinstance(c.get("gpu"), list) and len(c["gpu"]) == 2:
@@ -3765,6 +3924,55 @@ index 0000000..8b767b0
 +echo.
 +echo Done. Send v100_setup.log, v100_decodebench9.log and v100_prefillbench2.log back for review.
 +pause
+diff --git a/v100/18_merge_ab.bat b/v100/18_merge_ab.bat
+new file mode 100644
+index 0000000..db93b6d
+--- /dev/null
++++ b/v100/18_merge_ab.bat
+@@ -0,0 +1,18 @@
++@echo off
++rem V100 fork, step 18 - is the merged engine slower, or was the PC slower that afternoon?  USES BOTH GPUs, ~30 minutes,
++rem   nothing is compiled.  Four engine runs, alternating: the engine from before the merge (engine\strata.exe, with the
++rem   config saved as strata-unsloth-ud-q4_k_xl.json.pre-merge), the merged one, the old one again, the merged one again.
++rem   Log: v100_decodebench10.log (+ .json).  Close other programs first (browser tabs, games, anything busy).
++setlocal
++cd /d "%~dp0.."
++if not exist strata-unsloth-ud-q4_k_xl.json.pre-merge (
++  echo strata-unsloth-ud-q4_k_xl.json.pre-merge is missing - it is written by step 17.
++  pause
++  exit /b 1
++)
++echo This uses both GPUs for about 30 minutes. Stop the server and any other GPU program first.
++pause
++".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench10.log --variants pre_merge,baseline,pre_merge_end,baseline_end %*
++echo.
++echo Done. Send v100_decodebench10.log back for review.
++pause
+diff --git a/v100/19_merge_bisect.bat b/v100/19_merge_bisect.bat
+new file mode 100644
+index 0000000..f47f2b5
+--- /dev/null
++++ b/v100/19_merge_bisect.bat
+@@ -0,0 +1,19 @@
++@echo off
++rem V100 fork, step 19 - which part of the merged engine makes it decode slower.  USES BOTH GPUs, ~50 minutes,
++rem   nothing is compiled.  Eight engine runs: the pre-merge engine, the merged one as it is, then the merged one with
++rem   one group of its newer decode paths turned back off per run (PCIe share 0, decode batching off, shared-expert
++rem   stream off, the newer verify-window paths off, the host thread on the last core), the pre-merge engine again.
++rem   Log: v100_decodebench11.log (+ .json).  Close other programs first.
++setlocal
++cd /d "%~dp0.."
++if not exist strata-unsloth-ud-q4_k_xl.json.pre-merge (
++  echo strata-unsloth-ud-q4_k_xl.json.pre-merge is missing - it is written by step 17.
++  pause
++  exit /b 1
++)
++echo This uses both GPUs for about 50 minutes. Stop the server and any other GPU program first.
++pause
++".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench11.log --variants pre_merge,baseline,pcie0,decbatch0,shstream0,gpu_legacy,hostlast,pre_merge_end %*
++echo.
++echo Done. Send v100_decodebench11.log back for review.
++pause
 diff --git a/v100/1_setup_and_build.bat b/v100/1_setup_and_build.bat
 new file mode 100644
 index 0000000..56075a9
@@ -3788,6 +3996,33 @@ index 0000000..56075a9
 +".venv\Scripts\python.exe" tools\v100_setup.py %*
 +echo.
 +echo Done. Send v100_setup.log (in the Strata folder) back for review.
++pause
+diff --git a/v100/20_merge_fix.bat b/v100/20_merge_fix.bat
+new file mode 100644
+index 0000000..89a02ed
+--- /dev/null
++++ b/v100/20_merge_fix.bat
+@@ -0,0 +1,21 @@
++@echo off
++rem V100 fork, step 20 - the merged engine with the host thread hard-pinned again (as before the merge) and no PCIe
++rem   share for the V100's x4 link.  Part 1 (no GPU, a few minutes): rebuilds the engine (log v100_setup.log).
++rem   Part 2 (USES BOTH GPUs, ~40 minutes): six engine runs - the pre-merge engine, the rebuilt one, then the rebuilt one
++rem   with each fix undone in turn (0.1.40's host placement, 0.1.40's V100 PCIe share, the async copy thread on its old
++rem   spot), the pre-merge engine again.  Log: v100_decodebench12.log (+ .json).  Close other programs first.
++setlocal
++cd /d "%~dp0.."
++".venv\Scripts\python.exe" tools\v100_setup.py --context 262144
++if errorlevel 1 (
++  echo Setup or the build failed - send v100_setup.log back for review.
++  pause
++  exit /b 1
++)
++echo.
++echo Part 1 is done. Part 2 uses both GPUs for about 40 minutes. Stop the server and any other GPU program first.
++pause
++".venv\Scripts\python.exe" tools\v100_decodebench.py --log v100_decodebench12.log --variants pre_merge,baseline,host_cpuset,stage_pcie_up,job_spare,pre_merge_end %*
++echo.
++echo Done. Send v100_decodebench12.log (and v100_setup.log if anything failed) back for review.
 +pause
 diff --git a/v100/2_gpu_tests.bat b/v100/2_gpu_tests.bat
 new file mode 100644

@@ -120,6 +120,10 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAff
 struct ThreadAffinity {
 #if defined(_WIN32)
     std::vector<unsigned long> cpu_sets;
+    // V100 fork: the hard pin (the default here, as 0.1.32): the previous group affinity, restored as it was
+    bool hard = false;
+    unsigned short prev_group = 0;
+    unsigned long long prev_mask = 0;
 #else
     std::vector<unsigned long> mask;
 #endif

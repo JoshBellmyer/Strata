@@ -185,6 +185,9 @@ def main() -> int:
         if "--remote-expert-opt" in c["args"]:
             c["args"].remove("--remote-expert-opt")
         c["remote_expert_opt"] = False
+        # the async tier's copy thread: its default spot (the last P-core's SMT sibling) is a pool worker's on this
+        # PC (11 workers fill the P-cores' 12 threads but the host's), so it is left to the OS
+        c.setdefault("env", {})["STRATA_ADAPT_JOB_CPU"] = "-1"
         for k, v in keep.items():
             c.setdefault(k, v)
         if isinstance(c.get("gpu"), list) and len(c["gpu"]) == 2:

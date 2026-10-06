@@ -2997,6 +2997,14 @@ int main(int argc, char** argv) {
             std::string bursts;
             const double bw = probe_pcie_h2d_gbps(&bursts);
             if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
+            // V100 fork: a link under 4 GB/s (the V100's PCIe 3.0 x4) takes no share, as in 0.1.32: 0.1.40 gives it
+            // 0.09, and its stage's CPU and GPU time both rose (v100_decodebench11, pcie0).  STRATA_STAGE_PCIE_UPSTREAM=1
+            // keeps 0.1.40's rule.
+            static const bool stage_pcie_upstream = [] {
+                const char* v = std::getenv("STRATA_STAGE_PCIE_UPSTREAM");
+                return v != nullptr && v[0] == '1';
+            }();
+            if (bw > 0.0 && bw < 4.0 && !stage_pcie_upstream) st.pcie_frac = 0.0;
             std::fprintf(stderr, "strata generate: layer split: CUDA%d PCIe probe %.1f GB/s (best of %s) -> pcie_frac "
                                  "%.2f\n", st.dev, bw, bursts.c_str(), st.pcie_frac);
         }
