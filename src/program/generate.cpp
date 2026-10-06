@@ -5784,6 +5784,12 @@ int main(int argc, char** argv) {
                         PfPart& p = pf_parts[i];
                         const int64_t floor_c = pf_parts[i - 1].chunk;
                         const int64_t top_c = i == 1 ? INT64_MAX : pf_parts[1].chunk;
+                        // a stage after the second gets one hand-off per run of the one before it: no bigger chunk,
+                        // and the earlier stage's chunk only where this cache can lend it
+                        if (i >= 2) {
+                            p.chunk = fits_one(p, floor_c, true) ? floor_c : chunk;
+                            continue;
+                        }
                         p.chunk = floor_c;
                         // multiples of the earlier stage's chunk (0.1.40 picks CUDA0's on a 256-token grid), largest
                         // first, up to --prefill auto:N
@@ -8819,7 +8825,11 @@ int main(int argc, char** argv) {
                 // prompt needs, so a large chunk costs a short prompt nothing
                 // V100 fork: per participant - a later stage may read in bigger chunks (PfPart::chunk)
                 auto want_of = [&](const PfPart& p) -> int64_t {
-                    const int64_t want_full = equal_chunk(tokens, std::max(o.prefill_chunk, p.sp->max_chunk()));
+                    // CUDA0 at the configured chunk (relend may have lowered it below its laid-out maximum); a later
+                    // stage at its own, never above what its Prefill was laid out for
+                    const int64_t cap = &p == &pf_parts[0] ? o.prefill_chunk
+                                                           : std::min(std::max(o.prefill_chunk, p.chunk), p.sp->max_chunk());
+                    const int64_t want_full = equal_chunk(tokens, cap);
                     // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
                     return split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small) : want_full;
                 };

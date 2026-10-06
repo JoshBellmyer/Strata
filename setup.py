@@ -1042,7 +1042,10 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
         say("  This model runs in the low-RAM mode with its experts kept in RAM, on one GPU (recommended: steady RAM")
         say("  use). On both, the experts the GPUs do not hold are read through the OS file cache instead: faster in")
         say("  two reports (#364, #384), but RAM can fill up to 0 free during long prompts.")
-    if budget:
+    if budget and budget_split_ok():   # V100 fork: the budget stays on a split
+        say(f"  This model ({budget_model(cfg)}) keeps its RAM budget on both: each card's expert cache is left out of")
+        say("  it, so the RAM holds the most-used experts no GPU holds (docs/V100.md).")
+    elif budget:
         say(f"  This model ({budget_model(cfg)}) runs on one GPU with a RAM budget of its experts (recommended: the tested")
         say("  setup). On both it has no budget: all its experts are loaded into RAM at start, which this PC's RAM")
         say("  holds - about twice as fast in #498 (2x RTX 3090: 31 -> 64-78 tokens/s).")
@@ -1055,7 +1058,7 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
         say("  The installed engine has no code for " + ", ".join(g["name"] for g in missing) + ": to use them "
             "together, run START-HERE.bat --setup --gpus " + ",".join(str(g["index"]) for g in pair))
     elif ask("  Use both from now on? (you can change it later: START-HERE.bat --gpu N for one card)",
-             ["y", "n"], "n" if resident or short or budget else "y", yes) == "y":
+             ["y", "n"], "n" if resident or short or (budget and not budget_split_ok()) else "y", yes) == "y":
         cfg["gpu"] = [g["index"] for g in pair]
         cfg["layer_split"] = cfg.get("layer_split") or "auto"
         split_mmap(cfg)
