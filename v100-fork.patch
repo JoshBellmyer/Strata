@@ -534,7 +534,7 @@ index 037385a..c37fe6c 100644
      /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
      /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
 diff --git a/setup.py b/setup.py
-index ee657ce..df9c4cf 100644
+index ee657ce..5644445 100644
 --- a/setup.py
 +++ b/setup.py
 @@ -961,6 +961,14 @@ def unsloth_split_need_gb(model="UD-Q4_K_XL") -> float:
@@ -570,7 +570,28 @@ index ee657ce..df9c4cf 100644
          return cfg
      pair = can[:2]
      cfg["gpus_asked"] = True
-@@ -4446,9 +4454,13 @@ def main() -> int:
+@@ -1034,7 +1042,10 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
+         say("  This model runs in the low-RAM mode with its experts kept in RAM, on one GPU (recommended: steady RAM")
+         say("  use). On both, the experts the GPUs do not hold are read through the OS file cache instead: faster in")
+         say("  two reports (#364, #384), but RAM can fill up to 0 free during long prompts.")
+-    if budget:
++    if budget and budget_split_ok():   # V100 fork: the budget stays on a split
++        say(f"  This model ({budget_model(cfg)}) keeps its RAM budget on both: each card's expert cache is left out of")
++        say("  it, so the RAM holds the most-used experts no GPU holds (docs/V100.md).")
++    elif budget:
+         say(f"  This model ({budget_model(cfg)}) runs on one GPU with a RAM budget of its experts (recommended: the tested")
+         say("  setup). On both it has no budget: all its experts are loaded into RAM at start, which this PC's RAM")
+         say("  holds - about twice as fast in #498 (2x RTX 3090: 31 -> 64-78 tokens/s).")
+@@ -1047,7 +1058,7 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
+         say("  The installed engine has no code for " + ", ".join(g["name"] for g in missing) + ": to use them "
+             "together, run START-HERE.bat --setup --gpus " + ",".join(str(g["index"]) for g in pair))
+     elif ask("  Use both from now on? (you can change it later: START-HERE.bat --gpu N for one card)",
+-             ["y", "n"], "n" if resident or short or budget else "y", yes) == "y":
++             ["y", "n"], "n" if resident or short or (budget and not budget_split_ok()) else "y", yes) == "y":
+         cfg["gpu"] = [g["index"] for g in pair]
+         cfg["layer_split"] = cfg.get("layer_split") or "auto"
+         split_mmap(cfg)
+@@ -4446,9 +4457,13 @@ def main() -> int:
                           "install it anyway", "  Install it anyway?")
              warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
          budget = budget_choice(model, ram, a.resident_budget_gib)
@@ -856,7 +877,7 @@ index 7b53ac9..89cd915 100644
                               "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                               "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
 diff --git a/src/program/generate.cpp b/src/program/generate.cpp
-index 3b551f3..ec90f1d 100644
+index 3b551f3..d361630 100644
 --- a/src/program/generate.cpp
 +++ b/src/program/generate.cpp
 @@ -5464,6 +5464,17 @@ int main(int argc, char** argv) {
@@ -886,7 +907,7 @@ index 3b551f3..ec90f1d 100644
          };
          // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
          // per layer), otherwise max_blob each.
-@@ -5753,8 +5766,43 @@ int main(int argc, char** argv) {
+@@ -5753,8 +5766,49 @@ int main(int argc, char** argv) {
                      std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens so its buffers fit in "
                                           "every expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
                  o.prefill_chunk = chunk;
@@ -908,6 +929,12 @@ index 3b551f3..ec90f1d 100644
 +                        PfPart& p = pf_parts[i];
 +                        const int64_t floor_c = pf_parts[i - 1].chunk;
 +                        const int64_t top_c = i == 1 ? INT64_MAX : pf_parts[1].chunk;
++                        // a stage after the second gets one hand-off per run of the one before it: no bigger chunk,
++                        // and the earlier stage's chunk only where this cache can lend it
++                        if (i >= 2) {
++                            p.chunk = fits_one(p, floor_c, true) ? floor_c : chunk;
++                            continue;
++                        }
 +                        p.chunk = floor_c;
 +                        // multiples of the earlier stage's chunk (0.1.40 picks CUDA0's on a 256-token grid), largest
 +                        // first, up to --prefill auto:N
@@ -931,7 +958,7 @@ index 3b551f3..ec90f1d 100644
                      p.first_now = p.first;
                  }
                  // #340: a split stage whose card still has room for the chunk's buffers (its cache already holds
-@@ -5772,7 +5820,7 @@ int main(int argc, char** argv) {
+@@ -5772,7 +5826,7 @@ int main(int argc, char** argv) {
                          const strata::core::OnDevice on(p.dev);
                          size_t fb = 0, tb = 0;
                          if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
@@ -940,7 +967,7 @@ index 3b551f3..ec90f1d 100644
                          if ((uint64_t) fb >= need + (3ull << 29)) {
                              std::fprintf(stderr, "strata serve:   CUDA%d keeps its own prompt buffers (%.2f GiB of "
                                                   "%.2f GiB free): no loan\n", p.dev < 0 ? 0 : p.dev,
-@@ -5823,6 +5871,26 @@ int main(int argc, char** argv) {
+@@ -5823,6 +5877,26 @@ int main(int argc, char** argv) {
          // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned (#253) a
          // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
          // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
@@ -967,7 +994,7 @@ index 3b551f3..ec90f1d 100644
          auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
              for (size_t i = 0; i < stages.size(); ++i) {
                  GpuStage& st = *stages[i];
-@@ -5835,7 +5903,7 @@ int main(int argc, char** argv) {
+@@ -5835,7 +5909,7 @@ int main(int argc, char** argv) {
                      sb = st.cache.device_slot(pf_parts[i + 1].first);
                      sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                  }
@@ -976,7 +1003,7 @@ index 3b551f3..ec90f1d 100644
                                  err, sb, sbb)) {
                      err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
                      return err.find("do not fit") != std::string::npos ? 2 : 1;
-@@ -5860,7 +5928,10 @@ int main(int argc, char** argv) {
+@@ -5860,7 +5934,10 @@ int main(int argc, char** argv) {
                      const strata::core::OnDevice on(dev);
                      size_t fb = 0, tb = 0;
                      cudaMemGetInfo(&fb, &tb);
@@ -988,7 +1015,7 @@ index 3b551f3..ec90f1d 100644
                      if (need + kHeadroom > (int64_t) fb) {
                          dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
                          return false;
-@@ -5870,6 +5941,7 @@ int main(int argc, char** argv) {
+@@ -5870,6 +5947,7 @@ int main(int argc, char** argv) {
              };
              int dev = 0;
              int64_t need = 0, fb = 0;
@@ -996,7 +1023,7 @@ index 3b551f3..ec90f1d 100644
              if (!own_fits(o.prefill_chunk, dev, need, fb)) {
                  int64_t c = 0;
                  for (const int64_t s : kStepChunks) {
-@@ -5882,12 +5954,30 @@ int main(int argc, char** argv) {
+@@ -5882,12 +5960,30 @@ int main(int argc, char** argv) {
                                           "%lld MiB free: %lld-token chunks\n", (long long) o.prefill_chunk,
                                   (long long) (need >> 20), dev, (long long) (fb >> 20), (long long) c);
                      o.prefill_chunk = c;
@@ -1027,7 +1054,7 @@ index 3b551f3..ec90f1d 100644
              int64_t next = 0;
              for (const int64_t c : kStepChunks)
                  if (c < o.prefill_chunk) { next = c; break; }
-@@ -5903,6 +5993,7 @@ int main(int argc, char** argv) {
+@@ -5903,6 +5999,7 @@ int main(int argc, char** argv) {
                  sp.reset();
                  (void) cudaGetLastError();
                  o.prefill_chunk = next;
@@ -1035,7 +1062,7 @@ index 3b551f3..ec90f1d 100644
                  if (any_loan) {                  // smaller loans for the smaller chunk
                      for (PfPart& p : pf_parts)
                          if (p.first >= 0) {
-@@ -8726,17 +8817,21 @@ int main(int argc, char** argv) {
+@@ -8726,17 +8823,25 @@ int main(int argc, char** argv) {
                  const auto t_ln = Clock::now();
                  // what this segment needs, capped by the configured chunk: a request lends only what its own
                  // prompt needs, so a large chunk costs a short prompt nothing
@@ -1046,7 +1073,11 @@ index 3b551f3..ec90f1d 100644
 -                if (want <= 0) {
 +                // V100 fork: per participant - a later stage may read in bigger chunks (PfPart::chunk)
 +                auto want_of = [&](const PfPart& p) -> int64_t {
-+                    const int64_t want_full = equal_chunk(tokens, std::max(o.prefill_chunk, p.sp->max_chunk()));
++                    // CUDA0 at the configured chunk (relend may have lowered it below its laid-out maximum); a later
++                    // stage at its own, never above what its Prefill was laid out for
++                    const int64_t cap = &p == &pf_parts[0] ? o.prefill_chunk
++                                                           : std::min(std::max(o.prefill_chunk, p.chunk), p.sp->max_chunk());
++                    const int64_t want_full = equal_chunk(tokens, cap);
 +                    // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
 +                    return split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small) : want_full;
 +                };
@@ -1062,7 +1093,7 @@ index 3b551f3..ec90f1d 100644
                      if (!p.lent.empty()) {
                          if (want <= p.lent_chunk) continue;            // its current loan already covers this
                          // ONLY this participant's loan goes back: `refill` would return the other participants'
-@@ -8766,7 +8861,7 @@ int main(int argc, char** argv) {
+@@ -8766,7 +8871,7 @@ int main(int argc, char** argv) {
                      int64_t n_lent = 0;
                      for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
                      std::fprintf(stderr, "strata trace: lent %lld slots for %lld tokens in %.1f ms\n", (long long) n_lent,
@@ -1071,7 +1102,7 @@ index 3b551f3..ec90f1d 100644
                      std::fflush(stderr);
                  }
                  return true;
-@@ -10021,6 +10116,37 @@ int main(int argc, char** argv) {
+@@ -10021,6 +10126,37 @@ int main(int argc, char** argv) {
                               100.0 * (double) req_hits / (double) req_look,
                               (long long) req_hits, (long long) req_look, off);
              }
