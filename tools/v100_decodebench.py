@@ -39,7 +39,7 @@ LONG_NEW = 300
 
 # name -> (what it tests, extra args {flag: value|None}, extra env, cfg edit)
 VARIANTS = {
-    "baseline": ("the config as it is (4070S layers 0-16, V100 the rest)", {}, {}, None),
+    "baseline": ("the config as it is", {}, {}, None),
     "profile": ("baseline + the GPU stage stamps of every window (STRATA_VERIFY_PROFILE)", {},
                 {"STRATA_VERIFY_PROFILE": "1"}, None),
     "v100_only": ("the V100 alone, same config (the comparison you asked about)", {}, {}, one_gpu(1)),
@@ -147,21 +147,16 @@ VARIANTS.update({
                   {"--ple-gguf": None}, {}, None),
     "ple_shard_end": ("the PLE table from shard 2 again, last", {"--ple-gguf": None}, {}, None),
 })
-# round 8 (2026-10-03): the adaptive tier's swap budget per card (--adapt-stage-swaps CUDA0,CUDA1).  Replaying the
-# workload runs' routing (tools/v100_cachesim.py): the 4070 Super's layers answer ~55% of their lookups on the GPU,
-# the V100's ~94%, and the shared budget of 32 gives the 4070 Super only ~17 swaps a round; a budget per card
-# replayed 77.0 -> 80.0% (96,32).  The 4070 Super's swaps cross its x16 link; the V100 keeps its 32.
+# round 8 (2026-10-03): per-card swap budgets (--adapt-stage-swaps) raised the hit rate but not the speed; the option
+# was dropped in the upstream 0.1.40 merge.
+# merge check (2026-10-06): upstream 0.1.40's asynchronous adaptive tier (--adapt-async 1, in the config now) against
+# its blocking one
 VARIANTS.update({
-    "stage64_32": ("swap budget per card: 64 for the 4070S, 32 for the V100 (--adapt-stage-swaps 64,32)",
-                   {"--adapt-stage-swaps": "64,32"}, {}, None),
-    "stage96_32": ("swap budget per card: 96 for the 4070S, 32 for the V100", {"--adapt-stage-swaps": "96,32"}, {}, None),
-    "stage160_32": ("swap budget per card: 160 for the 4070S, 32 for the V100", {"--adapt-stage-swaps": "160,32"}, {},
-                    None),
-    "stage96_16": ("swap budget per card: 96 for the 4070S, 16 for the V100", {"--adapt-stage-swaps": "96,16"}, {}, None),
+    "async_off": ("upstream's blocking adaptive tier (--adapt-async 0)", {"--adapt-async": "0"}, {}, None),
 })
 ENGINE_LINE_KEYS = ("ple io", "page-locked", "locked resident", "decode timing", "decode GPU stages", "strata serve: stage ", "hit rate", "layer split auto",
                     "expert cache ", "layer split: CUDA", "strata serve: prompt ", "pcie_frac", "PCIe probe",
-                    "resident RAM mode", "adaptive", "ERROR", "error", "failed")
+                    "resident RAM mode", "adaptive", "asynchronous", "reads the prompt in", "ERROR", "error", "failed")
 
 
 def chat(tok, text):

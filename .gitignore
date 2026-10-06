@@ -37,19 +37,32 @@ td.log
 /strata-*.json
 /strata-*.log
 /build-strata.bat
+/build-strata-cuda12.bat
+/build-cuda12/
+/.strata-mcp/
 
 # image encoder (setup.py --vision): build output and the generated build script
 build-vision*/
 build-vision.bat
+build-vision-cuda12.bat
 
 # setup.py outputs (engine, downloads) and release builds
 /engine/
+/engine-cuda12/
 /build-release*/
 /dist/
 *.done
 /third_party/*.zip
 
+# IDEs
+.vscode/
+.idea/
+.cursor/
+
+/.ccache/
+/.rocm-win/
+
 # V100 fork: workload recordings (tools/v100_workload.py - engine logs, routing.bin of several hundred MB, zips)
 /runs/
-# the build script tools/v100_ple_split.py writes
+# the build scripts tools/v100_setup.py and tools/v100_ple_split.py write
 /build-v100-*.bat

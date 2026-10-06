@@ -81,6 +81,26 @@ class HuggingFacePins(unittest.TestCase):
         self.assertEqual([m for m, _ in seen], ["HEAD", "HEAD", "GET"])
         self.assertTrue(all("/resolve/main/" in u for _, u in seen[1:]))
 
+    def test_a_complete_part_is_finished_without_a_request(self):
+        """A .part with every byte (setup stopped between the last byte and the rename): renamed, not resumed with a
+        range past its end - the server answers that with 416, which download() retried 30 times, 10 s apart."""
+        seen = []
+
+        def urlopen(req, timeout=None):
+            seen.append((req.get_method(), req.headers.get("Range")))
+            if req.get_method() == "HEAD":
+                return Response(b"model bytes")
+            raise urllib.error.HTTPError(req.full_url, 416, "Range Not Satisfiable", {}, None)
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(setup.time, "sleep", lambda s: None):
+            dst = Path(d) / "m.gguf"
+            dst.with_name("m.gguf.part").write_bytes(b"model bytes")
+            quiet(setup.download, "https://example.com/m.gguf", dst)
+            self.assertEqual(dst.read_bytes(), b"model bytes")
+            self.assertTrue(setup.done(dst))
+        self.assertEqual(seen, [("HEAD", None)])
+
     def test_mtp_fetch_is_pinned_and_falls_back(self):
         import mtp_fetch
         self.assertRegex(mtp_fetch.REPO, SHA)
@@ -97,6 +117,48 @@ class HuggingFacePins(unittest.TestCase):
             self.assertIn("pinned revision", err.getvalue())
         finally:
             mtp_fetch.REPO = pinned
+
+    def test_hf_endpoint(self):
+        # #495: HF_ENDPOINT (a mirror) serves the same pinned revision; a trailing slash and blanks are dropped
+        repo = "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"
+        with mock.patch.dict(setup.os.environ, {}, clear=False):
+            setup.os.environ.pop("HF_ENDPOINT", None)
+            self.assertEqual(setup.hf(repo), f"https://huggingface.co/{repo}/resolve/{setup.HF_REVISIONS[repo]}/")
+            for value in ("https://hf-mirror.com", "https://hf-mirror.com/", " https://hf-mirror.com/ "):
+                setup.os.environ["HF_ENDPOINT"] = value
+                url = setup.hf(repo)
+                self.assertEqual(url, f"https://hf-mirror.com/{repo}/resolve/{setup.HF_REVISIONS[repo]}/")
+                self.assertRegex(url, SHA)
+                self.assertEqual(setup.hf_unpinned(url + "x.gguf"), f"https://hf-mirror.com/{repo}/resolve/main/x.gguf")
+            setup.os.environ["HF_ENDPOINT"] = ""
+            self.assertEqual(setup.hf_endpoint(), "https://huggingface.co")
+
+    def test_mtp_fetch_honours_hf_endpoint(self):
+        import importlib
+        import mtp_fetch
+        try:
+            with mock.patch.dict(mtp_fetch.os.environ, {"HF_ENDPOINT": "https://hf-mirror.com/"}):
+                importlib.reload(mtp_fetch)
+                self.assertTrue(mtp_fetch.REPO.startswith("https://hf-mirror.com/Qwen/Qwen3.8-Flash-Next/resolve/"))
+                self.assertRegex(mtp_fetch.REPO, SHA)
+                self.assertTrue(mtp_fetch.pinned())                 # the tensors' SHA-256 checks still apply
+        finally:
+            importlib.reload(mtp_fetch)
+        self.assertTrue(mtp_fetch.REPO.startswith("https://huggingface.co/"))
+
+    def test_step5_names_the_folder(self):
+        # #495: where setup expects the model files, and how to give it files downloaded by hand
+        from test_setup_golden import PROFILES, install
+        ram, found = PROFILES["96GB-1x16GB"]
+        with mock.patch.dict(setup.os.environ, {"HF_ENDPOINT": "https://hf-mirror.com"}):
+            code, out, cfg, _ = install(ram, found, ["--family", "qwen", "--model", "IQ3_XXS", "--no-start"])
+        self.assertEqual(code, 0)
+        text = out.replace("\\", "/")
+        self.assertRegex(text, r"The model files go in .*/models/IQ3_XXS")
+        self.assertIn("put them here with their original names (Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+                      text)
+        self.assertIn("--gguf-dir", text)
+        self.assertIn("Downloading from https://hf-mirror.com (HF_ENDPOINT)", text)
 
 
 class Engine(unittest.TestCase):
@@ -173,6 +235,21 @@ class Engine(unittest.TestCase):
                 z = self.root / "engine" / setup.PREBUILT_ASSET
                 self.assertFalse(z.exists())
                 self.assertFalse(z.with_name(z.name + ".done").exists())
+
+    def test_an_archive_that_does_not_unpack_is_not_kept(self):
+        """#397, for an archive that does not unpack (not a zip, or a damaged one): it kept its zip and .done mark,
+        so every later run failed on it, even after the right one was published."""
+        with tempfile.TemporaryDirectory() as folder:  # a --prebuilt folder, through the real download()
+            asset = Path(folder) / setup.PREBUILT_ASSET
+            asset.write_bytes(b"<html>not a zip</html>")
+            with self.assertRaises(zipfile.BadZipFile):
+                quiet(setup.get_prebuilt, folder, {"arch": 89}, "gpu")
+            with zipfile.ZipFile(asset, "w") as z:
+                z.writestr("BUILD.json", json.dumps({"version": ".".join(map(str, setup.MIN_ENGINE)), "archs": [89]}))
+                z.writestr(setup.EXE, b"engine")
+            eng, _ = quiet(setup.get_prebuilt, folder, {"arch": 89}, "gpu")
+        self.assertEqual(eng, self.root / "engine")
+        self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"engine")
 
     def test_an_installed_engine_is_kept(self):
         (self.root / "engine" / "BUILD.json").write_text(json.dumps(
