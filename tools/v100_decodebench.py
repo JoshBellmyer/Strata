@@ -196,6 +196,15 @@ VARIANTS.update({
     "job_spare": ("the async tier's copy thread on its default spare SMT sibling (STRATA_ADAPT_JOB_CPU unset)", {}, {},
                   lambda cfg: cfg.get("env", {}).pop("STRATA_ADAPT_JOB_CPU", None)),
 })
+# round 13 (2026-10-07): the CPU's expert reads (~65 GB/s, the RAM's speed) from a RAM copy in 2 MB pages, and the
+# GPU stage profile of each card (where the V100's ~13 ms a window goes)
+VARIANTS.update({
+    "largepages": ("the RAM copy of the experts in 2 MB large pages (STRATA_COMPLEMENT_LARGE_PAGES=1; needs the "
+                   "'Lock pages in memory' right, v100\\24a_grant_large_pages.bat)", {},
+                   {"STRATA_COMPLEMENT_LARGE_PAGES": "1"}, None),
+    "largepages_profile": ("large pages, with the GPU stage stamps", {},
+                           {"STRATA_COMPLEMENT_LARGE_PAGES": "1", "STRATA_VERIFY_PROFILE": "1"}, None),
+})
 VARIANTS.update({
     "pre_merge": ("the engine from before the merge (engine\\strata.exe) with the config saved before it", {}, {},
                   pre_merge),
@@ -203,7 +212,8 @@ VARIANTS.update({
 })
 ENGINE_LINE_KEYS = ("ple io", "page-locked", "locked resident", "decode timing", "decode GPU stages", "strata serve: stage ", "hit rate", "layer split auto",
                     "expert cache ", "layer split: CUDA", "strata serve: prompt ", "pcie_frac", "PCIe probe",
-                    "resident RAM mode", "adaptive", "asynchronous", "reads the prompt in", "ERROR", "error", "failed")
+                    "resident RAM mode", "adaptive", "asynchronous", "reads the prompt in", "ERROR", "error", "failed",
+                    "large pages", "cache complement ready")
 
 
 def chat(tok, text):

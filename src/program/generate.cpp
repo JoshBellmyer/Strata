@@ -508,6 +508,7 @@ struct Options {
     /// #282, opt-in: the largest chunk `--prefill auto` may take - 8192 by default; `--prefill auto:16384` or
     /// `auto:32768` (or STRATA_PREFILL_AUTO_MAX) lets it go further, never past the context
     int64_t prefill_auto_max = 8192;
+    int64_t prefill_stage_max = 8192;   // V100 fork: --prefill auto:N's N for the later stages' chunks (up to 131072)
     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
@@ -1670,6 +1671,9 @@ int main(int argc, char** argv) {
             const long long want_max = v.rfind("auto:", 0) == 0 ? std::atoll(v.c_str() + 5)
                                      : (o.prefill_auto && env_max != nullptr ? std::atoll(env_max) : 8192);
             o.prefill_auto_max = want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : 8192;
+            // V100 fork: a later stage of a layer split may read bigger chunks than 32768 (its cache lends them;
+            // the gathered hand-offs are a multiple of CUDA0's chunk) - CUDA0 keeps upstream's ceiling above
+            o.prefill_stage_max = std::max<int64_t>(o.prefill_auto_max, std::min<long long>(want_max, 131072) / 256 * 256);
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
         }
         else if (a == "--no-split-rows") o.no_split_rows = true;
@@ -5520,7 +5524,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: resident RAM mode: %.2f GiB of experts in RAM (%s), %lld in the GPU "
                                  "cache; adaptive swaps %s\n",
                          (double) src.resident_bytes() / 1073741824.0,
-                         src.complement_pinned() ? "page-locked" : src.locked_bytes() > 0 ? "locked" : "pageable",
+                         src.complement_pinned() ? "page-locked" : src.complement_large() ? "2 MB large pages"
+                         : src.locked_bytes() > 0 ? "locked" : "pageable",
                          (long long) xcache.resident(),
                          o.adapt_every > 0 && o.adapt_swaps > 0 ? "exchange them with the GPU cache (no file reads)"
                                                                 : "off");
@@ -5801,7 +5806,7 @@ int main(int argc, char** argv) {
                         p.chunk = floor_c;
                         // multiples of the earlier stage's chunk (0.1.40 picks CUDA0's on a 256-token grid), largest
                         // first, up to --prefill auto:N
-                        for (int64_t k = floor_c > 0 ? o.prefill_auto_max / floor_c : 0; k >= 2; --k) {
+                        for (int64_t k = floor_c > 0 ? o.prefill_stage_max / floor_c : 0; k >= 2; --k) {
                             const int64_t c = k * floor_c;
                             if (c > o.max_context || c > top_c) continue;
                             if (fits_one(p, c, true)) {

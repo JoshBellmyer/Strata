@@ -119,6 +119,17 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 bool built() { return true; }
 
 bool supported(int t) {
+#if defined(STRATA_MMQ_KQUANTS) && !defined(__HIPCC__)
+    // V100 fork: STRATA_MMQ_KQUANTS=0 (the config's env) sends UD-Q4_K_XL's Q4_K / Q5_K / Q5_1 experts back to the
+    // FP16 dequantize + cuBLAS path in an engine built with them (the A/B).  The 2026-10-02 failures of
+    // prefill_mmq_kquant_test were the test's own race (uploads on the legacy stream, the product on a non-blocking
+    // one), fixed there.
+    static const bool kq_off = [] {
+        const char* v = std::getenv("STRATA_MMQ_KQUANTS");
+        return v != nullptr && v[0] == '0';
+    }();
+    if (kq_off && (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q5_1)) return false;
+#endif
     switch ((ggml_type) t) {
         case GGML_TYPE_Q2_0:
 #ifdef STRATA_ORCA_Q4KS_MMQ

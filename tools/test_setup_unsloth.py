@@ -11,6 +11,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import sys
 import tempfile
 import types
@@ -416,6 +417,18 @@ class ForkBudgetSplit(Base):
             c = {"args": ["--native", "x-UD-Q4_K_XL-00001-of-00004.gguf", "--resident-budget-gib", "40"]}
             self.assertFalse(setup.split_budget(c, True, True))   # a start on several GPUs keeps it too
             self.assertIn("--resident-budget-gib", c["args"])
+
+
+class ForkKquantDefs(unittest.TestCase):
+    """V100 fork: an engine for a Volta card gets the MMQ prompt kernels for UD-Q4_K_XL's experts; others do not."""
+
+    def test_defs(self):
+        with mock.patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("STRATA_FORK_MMQ_KQUANTS", None)
+            self.assertEqual(setup.fork_kquant_defs([70, 89]), ["-DSTRATA_MMQ_KQUANTS=ON"])
+            self.assertEqual(setup.fork_kquant_defs([86, 120]), [])
+        with mock.patch.dict("os.environ", {"STRATA_FORK_MMQ_KQUANTS": "0"}):
+            self.assertEqual(setup.fork_kquant_defs([70, 89]), [])
 
 
 class IQ4XS(Base):

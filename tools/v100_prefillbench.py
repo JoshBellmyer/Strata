@@ -41,11 +41,45 @@ VARIANTS = {
     "v100_32k": ("the V100 reads 32768-token chunks (four of the 4070S's gathered)", {"--prefill": "auto:32768"}, TIMING),
     "v100_32k_pagelock": ("v100_32k, and the RAM copy page-locked (DMA without the host copies; WDDM may refuse it)",
                           {"--prefill": "auto:32768"}, {"STRATA_ARENA_PIN_GIB": "0", **TIMING}),
+    # round 3 (2026-10-07): llama.cpp's MMQ kernels for UD-Q4_K_XL's Q4_K / Q5_K / Q5_1 experts (the engine built with
+    # them, tools/v100_setup.py).  v100_prefillbench2: dequantizing to FP16 + cuBLAS was 76 of the 4070 Super's 100 s
+    # of GPU time on a 116K prompt, and a fixed ~11 s of every V100 chunk
+    "mmq_off": ("the FP16 dequantize + cuBLAS path for the experts (the config before; STRATA_MMQ_KQUANTS=0)",
+                {}, {"STRATA_MMQ_KQUANTS": "0", **TIMING}),
+    "mmq": ("the MMQ kernels for the experts on both cards", {}, {"STRATA_MMQ_KQUANTS": "1", **TIMING}),
+    "mmq_cuda0": ("the MMQ kernels on the 4070 Super only (the V100 keeps FP16 + cuBLAS)", {},
+                  {"STRATA_MMQ_KQUANTS": "1", "STRATA_MMQ_DEVICES": "0", **TIMING}),
+    "mmq_v100_37k": ("MMQ on both, and the V100 reads up to 40960-token chunks (four of the 4070S's)",
+                     {"--prefill": "auto:40960"}, {"STRATA_MMQ_KQUANTS": "1", **TIMING}),
+    # round 4 (2026-10-07): with MMQ on the 4070 Super (the config) its stage waits for the experts it streams (~30 GB
+    # per chunk through host copies) and the V100 (bound by its x4 link) idles until its first hand-off arrives
+    "cfg": ("the config as it is (MMQ on the 4070 Super only)", {}, TIMING),
+    "v100_big": ("the V100 reads bigger chunks (--prefill auto:65536; CUDA0 keeps its 32768 ceiling)",
+                 {"--prefill": "auto:65536"}, TIMING),
+    "first1": ("the first hand-off to the V100 is one 4070S chunk (the V100 starts sooner, one chunk more)", {},
+               {"STRATA_SPLIT_FIRST_HANDOFF": "1", **TIMING}),
+    "blocking": ("the host copy threads sleep while they wait for a DMA (no spinning)", {},
+                 {"STRATA_STAGER_BLOCKING": "1", **TIMING}),
+    "blocking_mmq2": ("no spinning, and MMQ on both cards", {},
+                      {"STRATA_STAGER_BLOCKING": "1", "STRATA_MMQ_DEVICES": None, **TIMING}),
+    "stager8": ("8 host copy threads per card and a 64-deep ring (4 and 16 now)", {},
+                {"STRATA_STAGER_THREADS": "8", "STRATA_STAGER_RING": "64", **TIMING}),
+    "pin16": ("16 GiB of the RAM copy (the most-used experts) page-locked: copied by DMA, no host copy", {},
+              {"STRATA_PARTIAL_PIN": "1", "STRATA_PARTIAL_PIN_GIB": "16", **TIMING}),
+    "pin28": ("28 GiB of the RAM copy page-locked", {},
+              {"STRATA_PARTIAL_PIN": "1", "STRATA_PARTIAL_PIN_GIB": "28", **TIMING}),
+    # round 5: the config with bench 4's two winners against the one before them
+    "prev": ("the config before bench 4 (--prefill auto:32768, 4 copy threads, a 16-deep ring)",
+             {"--prefill": "auto:32768"},
+             {"STRATA_STAGER_THREADS": None, "STRATA_STAGER_RING": None, **TIMING}),
+    "pin_all": ("the whole RAM copy page-locked (WDDM may refuse it, or later allocations)", {},
+                {"STRATA_ARENA_PIN_GIB": "0", **TIMING}),
 }
 DEFAULT_ORDER = ["same8k", "v100_16k", "v100_32k"]
 ENGINE_LINE_KEYS = ("prompt chunk", "reads the prompt in", "every stage reads", "borrows", "prompt path CUDA",
                     "prefill timing", "expert reads from the model files", "strata serve: prompt ", "hand-off",
-                    "cache complement ready", "FileExpertSource: allocating", "do not fit", "error", "ERROR", "failed")
+                    "cache complement ready", "FileExpertSource: allocating", "do not fit", "error", "ERROR", "failed",
+                    "prompt kernels", "MMQ", "registered", "page-lock", "pinned", "STRATA_ARENA_PIN_GIB")
 
 
 def chat(tok, text):
@@ -59,7 +93,12 @@ def run_variant(name, base_cfg, tok, log, n_tokens, seed):
     for flag, val in extra_args.items():
         args = CAL.with_arg(args, flag, val)
     cfg["args"] = args
-    cfg.setdefault("env", {}).update(extra_env)
+    env = cfg.setdefault("env", {})
+    for k, v in extra_env.items():   # None: the variable taken out of the config's env
+        if v is None:
+            env.pop(k, None)
+        else:
+            env[k] = v
     from serve.server import StrataEngine, child_env, engine_args
     log(f"\n=== variant {name}: {what}")
     log("    env:", json.dumps(extra_env), " extra args:", json.dumps(extra_args))

@@ -95,6 +95,11 @@ void product(mmq::Context& ctx, cudaStream_t s, const char* name, ggml_type t, i
     ck(cudaMemcpy(db.p, bounds.data(), bounds.size() * 4, cudaMemcpyHostToDevice), "bounds");
     ck(cudaMemcpy(dw.p, w.data(), w.size(), cudaMemcpyHostToDevice), "w");
     ck(cudaMemset(dy.p, 0xff, (size_t) rows * (size_t) out_rows * 4), "sentinel");
+    // V100 fork: the uploads and the sentinel above run on the legacy stream, which a cudaStreamNonBlocking stream does
+    // not wait for - a pageable cudaMemcpy can return before its DMA lands and cudaMemset is asynchronous - so the
+    // product could read part of the weights before they arrived, or be overwritten by the sentinel after it ran
+    // (2026-10-02: "unwritten or non-finite output" in a different product on each card)
+    ck(cudaDeviceSynchronize(), "uploads");
     mmq::quantize((const float*) dx.p, (const int32_t*) dsrc.p, dxq.p, (int) t, cols, cols, rows, s);
     mmq::Product p;
     p.w = dw.p; p.type = (int) t; p.w_rows = out_rows; p.w_cols = cols; p.expert_bytes = eb; p.n = n;
@@ -143,17 +148,24 @@ void product(mmq::Context& ctx, cudaStream_t s, const char* name, ggml_type t, i
 int main() {
     try {
         if (!mmq::built()) { std::printf("no MMQ in this build\n"); return 1; }
+        int dev = 0;
+        cudaDeviceProp prop{};
+        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess)
+            std::printf("GPU %d: %s (compute %d.%d)\n", dev, prop.name, prop.major, prop.minor);
         cudaStream_t s = nullptr;
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
         {
             mmq::Context ctx;
-            const std::vector<std::vector<int>> batches{{1, 3, 3}, {4, 1, 2}, {2, 3}, {17}};
+            // V100 fork: the last batch has prompt-sized groups (hundreds of rows an expert: several column tiles and the
+            // stream-k fixup), which the small ones never reach
+            const std::vector<std::vector<int>> batches{{1, 3, 3}, {4, 1, 2}, {2, 3}, {17}, {130, 1, 257, 64}};
             int trial = 0;
             for (const auto& counts : batches) {
                 const std::string tag = "-" + std::to_string(trial);
                 product(ctx, s, ("Q4_K gate/up" + tag).c_str(), GGML_TYPE_Q4_K, 1280, 2560, counts, trial);
                 product(ctx, s, ("Q5_K gate/up" + tag).c_str(), GGML_TYPE_Q5_K, 1280, 2560, counts, trial + 5);
-                product(ctx, s, ("Q6_K gate/up" + tag).c_str(), GGML_TYPE_Q6_K, 1280, 2560, counts, trial + 17);
+                if (mmq::supported((int) GGML_TYPE_Q6_K))   // CUDA: only a -DSTRATA_Q6K_EXPERTS=ON build has it
+                    product(ctx, s, ("Q6_K gate/up" + tag).c_str(), GGML_TYPE_Q6_K, 1280, 2560, counts, trial + 17);
                 product(ctx, s, ("Q5_1 down" + tag).c_str(), GGML_TYPE_Q5_1, 2560, 640, counts, trial + 9);
                 product(ctx, s, ("Q8_0 down" + tag).c_str(), GGML_TYPE_Q8_0, 2560, 640, counts, trial + 13);
                 ++trial;

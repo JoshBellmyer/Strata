@@ -2638,6 +2638,17 @@ def engine_defs(archs, toolkit=13) -> list:
     return ["-DSTRATA_EXPERIMENTAL_SM60=ON"] if min(int(x) for x in archs) < 75 or int(toolkit) == 12 else []
 
 
+def fork_kquant_defs(archs) -> list:
+    """V100 fork: an engine for a Volta card (the V100 + RTX 4070 Super PC) is built with llama.cpp's MMQ prompt kernels
+    for UD-Q4_K_XL's Q4_K / Q5_K / Q5_1 experts (upstream's -DSTRATA_MMQ_KQUANTS=ON, off in its released engines): the
+    FP16 dequantize + cuBLAS products were ~75% of the 4070 Super's prompt GPU time (v100_prefillbench2).
+    STRATA_MMQ_KQUANTS=0 in the config's env turns them off at run time; STRATA_FORK_MMQ_KQUANTS=0 here builds
+    without them."""
+    if os.environ.get("STRATA_FORK_MMQ_KQUANTS", "1") == "0":
+        return []
+    return ["-DSTRATA_MMQ_KQUANTS=ON"] if 70 in {int(x) for x in archs} else []
+
+
 def prebuilt_vision(meta: dict, gpu: dict, vision: str) -> str:
     """The image encoder to use with a ready-made engine (`meta`: its BUILD.json).  The encoder can cover fewer cards
     than the engine (0.1.30/0.1.31: no RTX 20 code, #331): such a card gets the CPU encoder - the same program - instead
@@ -2673,8 +2684,9 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     # same; the compile keeps the generations it was built for
     new_arch = local and not set(archs) <= built
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
+    kq = fork_kquant_defs(sorted(built | set(archs)) if local else archs)
     engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and not new_arch and \
-        (meta.get("isa_floor") or "") == floor
+        (meta.get("isa_floor") or "") == floor and bool(meta.get("mmq_kquants")) == bool(kq)
     vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
@@ -2692,6 +2704,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
         cmake_build(ROOT, bdir, "strata",
                     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
                      f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}", *engine_defs(archs, toolkit),
+                     *(kq or ["-DSTRATA_MMQ_KQUANTS=OFF"]),
                      *isa_floor_defs(floor, bdir, meta)],
                     vcvars, "build-strata-cuda12.bat" if t12 else "build-strata.bat")
         shutil.copy2(bdir / EXE, eng / EXE)
@@ -2708,7 +2721,8 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": archs,
                                  "vision": vision, **({"toolkit": 12} if t12 else {}),
                                  "cuda_dirs": dirs, "src": src, "vision_src": vsrc if want_vision else None,
-                                 **({"isa_floor": floor} if floor else {})}, indent=1))
+                                 **({"isa_floor": floor} if floor else {}),
+                                 **({"mmq_kquants": True} if kq else {})}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
 

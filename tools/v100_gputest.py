@@ -41,6 +41,7 @@ PARITY = [
     ("shared_expert_parity", ["--selftest"]),
     ("bf16_gemv_parity", ["--selftest"]),
     ("s_gemv_q8k_parity", ["--selftest"]),
+    ("prefill_mmq_kquant_test", []),   # the prompt path's MMQ products for UD-Q4_K_XL's expert formats (an MMQ build)
 ]
 
 

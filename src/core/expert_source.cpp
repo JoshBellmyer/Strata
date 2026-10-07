@@ -595,9 +595,14 @@ void FileExpertSource::close() {
             if (complement_partial_) (void) cudaHostUnregister(complement_arena_);
             if (complement_locked_ > 0)
                 strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
+#if defined(_WIN32)
+            if (complement_large_) (void) VirtualFree(complement_arena_, 0, MEM_RELEASE);
+            else
+#endif
             std::free(complement_arena_);
         }
     }
+    complement_large_ = false;
     if (xstage_ != nullptr) {
         if (xstage_pinned_) (void) cudaFreeHost(xstage_);
         else std::free(xstage_);
@@ -1798,12 +1803,17 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
+    bool large = false;         ///< V100 fork: the copy is in 2 MB pages (STRATA_COMPLEMENT_LARGE_PAGES=1)
     auto release = [&]() {
         if (arena == nullptr) return;
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
             if (partial_pin > 0) (void) cudaHostUnregister(arena);
             if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
+#if defined(_WIN32)
+            if (large) (void) VirtualFree(arena, 0, MEM_RELEASE);
+            else
+#endif
             std::free(arena);
         }
         arena = nullptr;
@@ -1846,6 +1856,54 @@ bool FileExpertSource::pin_cache_complement(
                 std::fflush(stderr);
             }
             errno = 0;
+#if defined(_WIN32)
+            // V100 fork: STRATA_COMPLEMENT_LARGE_PAGES=1 - the RAM copy in 2 MB pages.  The CPU computes the experts no
+            // GPU holds by streaming them from this copy (~65 GB/s on the 4070 Super + V100 PC, near what dual-channel
+            // DDR5 gives); in 4 KB pages every 3 MB expert crosses ~750 page boundaries, where the hardware prefetchers
+            // stop and the TLB misses.  Large pages are never paged out (nothing to lock) and need the "Lock pages in
+            // memory" right (SeLockMemoryPrivilege) on the account; without it, or when Windows has too few free 2 MB
+            // pages, the copy is the normal one below.
+            static const bool want_large = [] {
+                const char* v = std::getenv("STRATA_COMPLEMENT_LARGE_PAGES");
+                return v != nullptr && v[0] == '1';
+            }();
+            if (want_large && pin) {
+                HANDLE tok = nullptr;
+                if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+                    TOKEN_PRIVILEGES tp{};
+                    tp.PrivilegeCount = 1;
+                    if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
+                        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                        (void) AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr);
+                    }
+                    CloseHandle(tok);
+                }
+                const SIZE_T lp = GetLargePageMinimum();
+                if (lp > 0) {
+                    const SIZE_T lbytes = (SIZE_T) (((SIZE_T) bytes + lp - 1) / lp * lp);
+                    const auto t0 = std::chrono::steady_clock::now();
+                    arena = VirtualAlloc(nullptr, lbytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+                    const DWORD le = arena ? 0 : GetLastError();
+                    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    if (arena != nullptr) {
+                        large = true;
+                        char m[160];
+                        std::snprintf(m, sizeof m, "in %.1f GiB of 2 MB large pages (allocated in %.1f s)",
+                                      (double) lbytes / 1073741824.0, secs);
+                        note += (note.empty() ? "" : "; ") + std::string(m);
+                    } else {
+                        char m[220];
+                        std::snprintf(m, sizeof m, "large pages refused (VirtualAlloc error %lu: %s); 4 KB pages",
+                                      (unsigned long) le,
+                                      le == 1314 ? "the account lacks 'Lock pages in memory'"
+                                      : le == 1450 ? "too few free 2 MB pages - after a restart there are more"
+                                                   : "see the error code");
+                        note += (note.empty() ? "" : "; ") + std::string(m);
+                    }
+                }
+            }
+            if (arena == nullptr)
+#endif
             arena = std::malloc((size_t) bytes);
             if (arena == nullptr) {
                 const int allocation_errno = errno;
@@ -1855,7 +1913,7 @@ bool FileExpertSource::pin_cache_complement(
                 log_complement_memory("after pageable allocation failure", bytes);
                 return false;
             }
-            if (pin) {
+            if (pin && !large) {
                 // CS-T, a RAM budget: its bytes are in profile order, hottest first, so the driver is asked to
                 // register the largest prefix it takes (from the cap down in 2 GiB steps).  Those experts can be
                 // read by the GPU over PCIe (--pcie-frac) and copied by DMA; only the rest is locked in the working
@@ -2043,6 +2101,7 @@ bool FileExpertSource::pin_cache_complement(
     complement_partial_ = !pinned_ok && partial_pin > 0;
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
+    complement_large_ = large;
     complement_lent_slots_ = lend ? n_slots - keep_from : 0;
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",

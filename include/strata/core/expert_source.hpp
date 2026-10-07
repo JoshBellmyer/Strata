@@ -491,6 +491,7 @@ public:
     bool complement_pinned() const { return complement_pinned_; }
     bool complement_ready() const { return complement_ready_; }
     uint64_t locked_bytes() const { return complement_locked_; }
+    bool complement_large() const { return complement_large_; }   ///< V100 fork: in 2 MB pages
     /// Lend-region slots whose experts the compact copy holds (the last ones of the cache).
     int64_t resident_lent_slots() const { return complement_lent_slots_; }
 
@@ -669,6 +670,7 @@ private:
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
+    bool complement_large_ = false;           ///< V100 fork: the copy is a VirtualAlloc of 2 MB pages
     int64_t complement_lent_slots_ = 0;
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };

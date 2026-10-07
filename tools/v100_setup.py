@@ -24,7 +24,7 @@ WIN = os.name == "nt"
 TEST_TARGETS = ["native_expert_parity", "mmvq_multi_parity", "gr_parity", "gdn_parity",
                 "qsa_parity", "kv_q8_parity", "elementwise_parity", "sampler_parity", "router_top10_parity",
                 "rope_parity", "quantize_act_parity", "shared_expert_parity", "bf16_gemv_parity",
-                "s_gemv_q8k_parity", "strata-device"]
+                "s_gemv_q8k_parity", "strata-device", "prefill_mmq_kquant_test", "v100_membw"]
 
 
 def build_dir() -> Path:
@@ -95,11 +95,14 @@ def main() -> int:
     py = sys.executable
     # your own settings in the config (a "sampling" block, "aliases", "max_tokens") - setup writes the config anew,
     # so they are put back after it
-    keep = {}
+    keep, keep_env = {}, {}
     try:
         import json
         old = json.loads((ROOT / "strata-unsloth-ud-q4_k_xl.json").read_text(encoding="utf-8-sig"))
         keep = {k: old[k] for k in ("sampling", "aliases", "max_tokens") if k in old}
+        keep_env = {k: v for k, v in (old.get("env") or {}).items()
+                    if k in ("STRATA_MMQ_KQUANTS", "STRATA_MMQ_DEVICES", "STRATA_STAGER_THREADS",
+                             "STRATA_STAGER_RING")}
     except (OSError, ValueError):
         pass
     if not a.skip_setup:
@@ -160,7 +163,7 @@ def main() -> int:
         import json
         c = json.loads(cfg.read_text(encoding="utf-8-sig"))
         # v100_prefillbench (2026-10-03): the V100 reads long prompts in 32768-token chunks - 814 vs 543 tok/s on a
-        # 114K prompt (16384: 758)
+        # 114K prompt (16384: 758); since bench 4 auto:65536 (the V100 above 32768, CUDA0 still at most 32768)
         # v100_decodebench2 (2026-10-03): at most 32 adaptive swaps per round - 55.6 / 46.3 tok/s (short / after 60K)
         # against 52.4 / 40.9 with 96 (the swaps share the V100's x4 link with decoding)
         # v100_decodebench3/4 (2026-10-03): --spec-min-p 0.7 was a little ahead in every round; layers 0-19 on the
@@ -171,7 +174,7 @@ def main() -> int:
         # which is faster up to ~1000 tokens: --short-read 768 (was 64) saves ~165 s an hour of that work
         # upstream 0.1.40 merge: the fork's adaptive tier without stalls (decode 38.6 -> 52.4 tok/s) is upstream's
         # --adapt-async 1 now (the same three steps on a worker, per card on a split); it is opt-in there
-        for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11"), ("--prefill", "auto:32768"),
+        for flag, val in (("--pool-affinity", "auto"), ("--pool-workers", "11"), ("--prefill", "auto:65536"),
                           ("--adapt-swaps", "32"), ("--spec-min-p", "0.7"),
                           ("--short-read", "768"), ("--adapt-async", "1")):
             if flag in c["args"]:
@@ -188,6 +191,17 @@ def main() -> int:
         # the async tier's copy thread: its default spot (the last P-core's SMT sibling) is a pool worker's on this
         # PC (11 workers fill the P-cores' 12 threads but the host's), so it is left to the OS
         c.setdefault("env", {})["STRATA_ADAPT_JOB_CPU"] = "-1"
+        # v100_prefillbench3 (2026-10-07): the MMQ prompt kernels for the experts on the 4070 Super only - a 116K
+        # prompt 101.7 s against 118.0 s with FP16 + cuBLAS (MMQ on both cards 111.9 s: the V100 is bound by its x4
+        # link either way); the kernel test passes on both cards.  Values set before are kept.
+        c["env"]["STRATA_MMQ_KQUANTS"] = keep_env.get("STRATA_MMQ_KQUANTS", "1")
+        c["env"]["STRATA_MMQ_DEVICES"] = keep_env.get("STRATA_MMQ_DEVICES", "0")
+        # v100_prefillbench4 (2026-10-07): 8 host copy threads per card and a 64-deep ring (4 / 16 before) - 96.8 s
+        # against 101.9 s on a 116K prompt; --prefill auto:65536 lets the V100 read 39,680-token chunks (3 on that
+        # prompt instead of 4): 96.7 s.  Page-locking part or all of the RAM copy did not help prompts (the V100's
+        # stage sets the pace) and cost ~15% of the writing speed.
+        c["env"]["STRATA_STAGER_THREADS"] = keep_env.get("STRATA_STAGER_THREADS", "8")
+        c["env"]["STRATA_STAGER_RING"] = keep_env.get("STRATA_STAGER_RING", "64")
         for k, v in keep.items():
             c.setdefault(k, v)
         if isinstance(c.get("gpu"), list) and len(c["gpu"]) == 2:

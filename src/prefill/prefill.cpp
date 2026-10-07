@@ -352,7 +352,15 @@ struct Stager {
                 pageable[(size_t) i].resize(blob_bytes);
                 buf[i] = pageable[(size_t) i].data();
             }
-            if (cudaEventCreateWithFlags(&dma_done[i], cudaEventDisableTiming) != cudaSuccess) return false;
+            // V100 fork: STRATA_STAGER_BLOCKING=1 - the copy threads sleep while they wait for a ring buffer's DMA
+            // instead of spinning on it (a card on a slow link kept its 4 threads spinning for most of a prompt,
+            // taking CPU time from the other card's host copies: v100_prefillbench3)
+            static const bool blocking = [] {
+                const char* v = std::getenv("STRATA_STAGER_BLOCKING");
+                return v != nullptr && v[0] == '1';
+            }();
+            if (cudaEventCreateWithFlags(&dma_done[i], cudaEventDisableTiming | (blocking ? cudaEventBlockingSync : 0)) !=
+                cudaSuccess) return false;
         }
         cudaGetDevice(&device);
         for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
@@ -767,9 +775,31 @@ const MmqPlan& mmq_plan() {
             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
             p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
         }
+        // V100 fork: STRATA_MMQ_DEVICES=<CUDA ordinals> limits MMQ to those cards (the others take the FP16 path); every
+        // card then also gets the FP16 path's buffers, since the sizes are counted once for all of them
+        if (p.any && std::getenv("STRATA_MMQ_DEVICES") != nullptr) p.fallback = true;
         return p;
     }();
     return plan;
+}
+// V100 fork: whether this card runs the MMQ products (STRATA_MMQ_DEVICES, e.g. "0" = the first card only; unset: all)
+bool mmq_on_device(int dev) {
+    static const std::vector<int> only = [] {
+        std::vector<int> v;
+        const char* e = std::getenv("STRATA_MMQ_DEVICES");
+        if (e == nullptr) return v;
+        for (const char* q = e; *q;) {
+            char* end = nullptr;
+            const long d = std::strtol(q, &end, 10);
+            if (end == q) { ++q; continue; }
+            v.push_back((int) d);
+            q = end;
+        }
+        if (v.empty()) v.push_back(-1);   // set but naming no card: MMQ nowhere
+        std::fprintf(stderr, "strata: prompt kernels: MMQ only on CUDA %s (STRATA_MMQ_DEVICES), the FP16 path elsewhere\n", e);
+        return v;
+    }();
+    return only.empty() || std::find(only.begin(), only.end(), dev) != only.end();
 }
 // #136 P3: a layout whose chunks run the fused experts (STRATA_PF_FUSED=1, the Q2_0 pack, a streamed chunk of
 // stream_all_min() tokens or more).  Its GU, H and Xq hold only the fused path's grouping tables, int8 H and per-token
@@ -1722,6 +1752,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         hand_cap = std::max(m.T, std::min(want, m.hand_rows));
     }
+    // V100 fork: STRATA_SPLIT_FIRST_HANDOFF=N - the first hand-off of a prompt carries at most N of this stage's chunks,
+    // so the next stage starts sooner (it idles until its first hand-off arrives) at the price of one more of its
+    // chunks (the next stage streams its missing experts once per hand-off).  Unset: hand-offs as big as its chunk.
+    static const int64_t first_handoff_chunks = [] {
+        const char* v = std::getenv("STRATA_SPLIT_FIRST_HANDOFF");
+        return v != nullptr && std::atoll(v) > 0 ? (int64_t) std::atoll(v) : (int64_t) 0;
+    }();
+    bool first_hand = true;
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
@@ -2543,7 +2581,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // keep MMQ; without the variable nothing here runs.  A native pack's layer takes the native kernels
                     // (moe_fused_iq.hpp) where they cover its two formats, else MMQ (or the FP16 path: IQ1_M).
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
-                    const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
+                    const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l] && mmq_on_device(m.device);
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
                     // --peer-device: MMQ only, whether or not the peer took the prompt path (set_peer can decline), as
@@ -2640,7 +2678,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             ++m.cnt[(size_t) e];
                         }
                         // multi-GPU: the rows of the experts the peer computes go last, as one block [rows_local, T*K)
-                        const bool pre_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
+                        const bool pre_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l] && mmq_on_device(m.device);
                         std::vector<char> on_peer;
                         int64_t rows_local = T * K, rows_peer = 0;
                         if (m.pp && pre_mmq) {
@@ -3266,7 +3304,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             acc_n += T;
             // gather the next chunk too when it still fits the next stage's chunk
-            if (c0 + T < n && acc_n + std::min(m.T, n - (c0 + T)) <= hand_cap) continue;
+            const int64_t cap_now = first_hand && first_handoff_chunks > 0
+                                        ? std::min(hand_cap, std::max(m.T, first_handoff_chunks * m.T)) : hand_cap;
+            if (c0 + T < n && acc_n + std::min(m.T, n - (c0 + T)) <= cap_now) continue;
+            first_hand = false;
             // Only at hand-off boundaries: the next stage reports (and saves its checkpoint part) there, so a part
             // saved between them would never be completed.
             // Wait only for the DIRECT successor's previous chunk. That successor
